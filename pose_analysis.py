@@ -35,174 +35,96 @@ def calculate_angle(a, b, c):
     return round(ang, 2)
 
 def draw_angle(image, point, angle, feedback, color=(0, 255, 0), y_offset=0):
-    image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-    pil_img = Image.fromarray(image_rgb)
-    draw = ImageDraw.Draw(pil_img)
+    """
+    Desenha o ângulo e o feedback na imagem.
+    """
+    h, w = image.shape[:2]
+    x, y = int(point[0] * w), int(point[1] * h)
+    
+    # Desenhar o ângulo
+    cv2.putText(
+        image,
+        f"{int(angle)}°",
+        (x - 20, y - 20),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.7,
+        color,
+        2
+    )
+    
+    # Desenhar o feedback
+    if feedback:
+        cv2.putText(
+            image,
+            feedback,
+            (10, 30 + y_offset),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            color,
+            2
+        )
 
-    try:
-        font = ImageFont.truetype("arial.ttf", 20)
-    except:
-        font = ImageFont.load_default()
-
-    draw.text((int(point[0]), int(point[1])), f"{angle} graus", fill=color, font=font)
-    draw.text((50, 50 + y_offset), feedback, fill=color, font=font)
-
-    image_bgr = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
-    image[:,:,:] = image_bgr[:,:,:]
-
-def avaliar_angulo(nome, angulo):
-    global exercicio_atual
-
-    if exercicio_atual == "Agachamento":
-        if "Joelho" in nome:
-            if angulo < 70:
-                return "Desce mais - Joelho deve estar mais flexionado", (0, 255, 255)
-            elif angulo > 120:
-                return "Muito profundo - Reduza a profundidade", (0, 0, 255)
-            else:
-                return "Boa execução do joelho", (0, 255, 0)
-        elif "Quadril" in nome:
-            if angulo < 80:
-                return "Mantenha o quadril mais alto", (0, 255, 255)
-            elif angulo > 100:
-                return "Quadril muito alto", (0, 0, 255)
-            else:
-                return "Boa posição do quadril", (0, 255, 0)
-        elif "Tronco" in nome:
-            if angulo < 85 or angulo > 95:
-                return "Mantenha o tronco ereto", (0, 0, 255)
-            else:
-                return "Boa postura do tronco", (0, 255, 0)
-        else:
-            return f"{nome}: Postura ok", (0, 255, 0)
-
-    elif exercicio_atual == "Flexao":
-        if "Cotovelo" in nome:
-            if angulo > 150:
-                return "Desce mais - Aproxime o peito do chão", (0, 255, 255)
-            elif angulo < 70:
-                return "Muito dobrado - Suba mais", (0, 0, 255)
-            else:
-                return "Boa execução do cotovelo", (0, 255, 0)
-        elif "Quadril" in nome:
-            if angulo < 170:
-                return "Mantenha o quadril alinhado com o corpo", (0, 0, 255)
-            else:
-                return "Boa posição do quadril", (0, 255, 0)
-        elif "Tronco" in nome:
-            if angulo < 85 or angulo > 95:
-                return "Mantenha o corpo reto", (0, 0, 255)
-            else:
-                return "Boa postura do corpo", (0, 255, 0)
-        else:
-            return f"{nome}: Postura ok", (0, 255, 0)
-
-    elif exercicio_atual == "Prancha":
-        if "Cotovelo" in nome:
-            if angulo < 85 or angulo > 95:
-                return "Mantenha os cotovelos a 90°", (0, 0, 255)
-            else:
-                return "Boa posição dos cotovelos", (0, 255, 0)
-        elif "Joelho" in nome:
-            if angulo < 170:
-                return "Mantenha as pernas retas", (0, 0, 255)
-            else:
-                return "Boa posição das pernas", (0, 255, 0)
-        elif "Quadril" in nome:
-            if angulo < 170:
-                return "Mantenha o quadril alinhado com o corpo", (0, 0, 255)
-            else:
-                return "Boa posição do quadril", (0, 255, 0)
-        elif "Tronco" in nome:
-            if angulo < 85 or angulo > 95:
-                return "Mantenha o corpo reto", (0, 0, 255)
-            else:
-                return "Boa postura do corpo", (0, 255, 0)
-        else:
-            return f"{nome}: Postura ok", (0, 255, 0)
-
-    elif exercicio_atual == "Lunge":
-        if "Joelho" in nome:
-            if "Direito" in nome:
-                if angulo < 85 or angulo > 95:
-                    return "Joelho direito deve estar a 90°", (0, 0, 255)
-                else:
-                    return "Boa posição do joelho direito", (0, 255, 0)
-            else:
-                if angulo < 85 or angulo > 95:
-                    return "Joelho esquerdo deve estar a 90°", (0, 0, 255)
-                else:
-                    return "Boa posição do joelho esquerdo", (0, 255, 0)
-        elif "Quadril" in nome:
-            if angulo < 85 or angulo > 95:
-                return "Mantenha o quadril nivelado", (0, 0, 255)
-            else:
-                return "Boa posição do quadril", (0, 255, 0)
-        elif "Tronco" in nome:
-            if angulo < 85 or angulo > 95:
-                return "Mantenha o tronco ereto", (0, 0, 255)
-            else:
-                return "Boa postura do tronco", (0, 255, 0)
-        else:
-            return f"{nome}: Postura ok", (0, 255, 0)
-
-    elif exercicio_atual == "Deadlift":
-        if "Joelho" in nome:
-            if angulo < 150:
-                return "Mantenha as pernas mais retas", (0, 0, 255)
-            else:
-                return "Boa posição das pernas", (0, 255, 0)
-        elif "Cotovelo" in nome:
-            if angulo < 170:
-                return "Mantenha os braços retos", (0, 0, 255)
-            else:
-                return "Boa posição dos braços", (0, 255, 0)
-        elif "Quadril" in nome:
-            if angulo < 80:
-                return "Mantenha o quadril mais alto", (0, 255, 255)
-            elif angulo > 100:
-                return "Quadril muito alto", (0, 0, 255)
-            else:
-                return "Boa posição do quadril", (0, 255, 0)
-        elif "Tronco" in nome:
-            if angulo < 85 or angulo > 95:
-                return "Mantenha a coluna neutra", (0, 0, 255)
-            else:
-                return "Boa postura da coluna", (0, 255, 0)
-        else:
-            return f"{nome}: Postura ok", (0, 255, 0)
-
-    elif exercicio_atual == "Shoulder Press":
-        if "Cotovelo" in nome:
-            if angulo < 85 or angulo > 95:
-                return "Mantenha os cotovelos a 90°", (0, 0, 255)
-            else:
-                return "Boa posição dos cotovelos", (0, 255, 0)
-        elif "Joelho" in nome:
-            if angulo < 170:
-                return "Mantenha as pernas retas", (0, 0, 255)
-            else:
-                return "Boa posição das pernas", (0, 255, 0)
-        elif "Ombro" in nome:
-            if angulo < 85 or angulo > 95:
-                return "Mantenha os ombros alinhados", (0, 0, 255)
-            else:
-                return "Boa posição dos ombros", (0, 255, 0)
-        elif "Tronco" in nome:
-            if angulo < 85 or angulo > 95:
-                return "Mantenha o tronco ereto", (0, 0, 255)
-            else:
-                return "Boa postura do tronco", (0, 255, 0)
-        else:
-            return f"{nome}: Postura ok", (0, 255, 0)
-
-    else:
-        if angulo < 30:
-            return f"{nome}: Extensão excessiva", (0, 255, 255)
-        elif angulo > 160:
-            return f"{nome}: Flexão excessiva", (0, 0, 255)
-        else:
-            return f"{nome}: Postura ok", (0, 255, 0)
+def avaliar_angulo(angulo_atual, angulo_referencia, nome_articulacao, exercicio_atual, etapa_atual):
+    """
+    Avalia se o ângulo atual está próximo do ângulo de referência.
+    Retorna feedback.
+    """
+    # Margens de tolerância específicas para cada articulação e exercício
+    margens = {
+        "Agachamento": {
+            "Joelho Direito": 15,
+            "Joelho Esquerdo": 15,
+            "Quadril": 15,
+            "Tronco": 10,
+            "Cotovelo Direito": 20,
+            "Cotovelo Esquerdo": 20,
+            "Ombro Direito": 20,
+            "Ombro Esquerdo": 20
+        },
+        "Flexao": {
+            "Cotovelo Direito": 10,
+            "Cotovelo Esquerdo": 10,
+            "Quadril": 15,
+            "Tronco": 10,
+            "Joelho Direito": 15,
+            "Joelho Esquerdo": 15,
+            "Ombro Direito": 15,
+            "Ombro Esquerdo": 15
+        }
+    }
+    
+    # Obter a margem de tolerância para a articulação atual
+    margem = margens.get(exercicio_atual, {}).get(nome_articulacao, 15)
+    
+    # Calcular a diferença absoluta
+    diferenca = abs(angulo_atual - angulo_referencia)
+    
+    # Gerar feedback específico para cada exercício e etapa
+    feedback = ""
+    if exercicio_atual == "Flexao":
+        if nome_articulacao in ["Cotovelo Direito", "Cotovelo Esquerdo"]:
+            if etapa_atual == 0:  # Posição inicial
+                if angulo_atual < angulo_referencia - margem:
+                    feedback = f"{nome_articulacao}: Estenda mais o braço"
+                elif angulo_atual > angulo_referencia + margem:
+                    feedback = f"{nome_articulacao}: Mantenha os braços estendidos"
+            else:  # Posição baixa
+                if angulo_atual < angulo_referencia - margem:
+                    feedback = f"{nome_articulacao}: Desça mais"
+                elif angulo_atual > angulo_referencia + margem:
+                    feedback = f"{nome_articulacao}: Mantenha a posição baixa"
+        elif nome_articulacao == "Tronco":
+            if angulo_atual > angulo_referencia + margem:
+                feedback = "Mantenha o corpo reto"
+            elif angulo_atual < angulo_referencia - margem:
+                feedback = "Não arqueie as costas"
+        elif nome_articulacao == "Quadril":
+            if angulo_atual > angulo_referencia + margem:
+                feedback = "Mantenha o quadril alinhado"
+            elif angulo_atual < angulo_referencia - margem:
+                feedback = "Não deixe o quadril cair"
+    
+    return feedback, (255, 255, 255)  # Retorna feedback e cor branca
 
 def get_reference_pose():
     """
@@ -235,7 +157,7 @@ def get_reference_pose():
             }
         ],
         "Flexao": [
-            {  # Etapa 0: Posição alta da flexão
+            {  # Etapa 0: Posição inicial
                 "Cotovelo Direito": 160,
                 "Cotovelo Esquerdo": 160,
                 "Quadril": 170,
@@ -245,7 +167,17 @@ def get_reference_pose():
                 "Ombro Direito": 180,
                 "Ombro Esquerdo": 0
             },
-            {  # Etapa 1: Posição baixa da flexão
+            {  # Etapa 1: Meio caminho
+                "Cotovelo Direito": 120,
+                "Cotovelo Esquerdo": 120,
+                "Quadril": 170,
+                "Tronco": 0,  # Horizontalizado
+                "Joelho Direito": 170,
+                "Joelho Esquerdo": 170,
+                "Ombro Direito": 180,
+                "Ombro Esquerdo": 0
+            },
+            {  # Etapa 2: Posição baixa
                 "Cotovelo Direito": 90,
                 "Cotovelo Esquerdo": 90,
                 "Quadril": 170,
@@ -366,7 +298,7 @@ def atualizar_etapa():
     # Definir quantidade de etapas por exercício
     etapas_por_exercicio = {
         "Agachamento": 2,
-        "Flexao": 2,
+        "Flexao": 3,
         "Prancha": 1,
         "Lunge": 3,
         "Deadlift": 2,
@@ -502,7 +434,7 @@ def analyze_pose(image):
 
                 angle = calculate_angle(a, b, c)
                 calculated_angles[name] = angle
-                feedback, color = avaliar_angulo(name, angle)
+                feedback, color = avaliar_angulo(angle, angle, name, exercicio_atual, etapa_atual)
                 
                 draw_angle(image, b, angle, feedback, color=color, y_offset=y_offset)
                 y_offset += 30
@@ -853,6 +785,8 @@ def process_camera():
             
             # Inicializar dicionário para armazenar ângulos calculados
             calculated_angles = {}
+            # Lista para feedbacks principais
+            main_feedbacks = []
             
             if results.pose_landmarks:
                 mp_drawing.draw_landmarks(frame, results.pose_landmarks, mp_pose.POSE_CONNECTIONS)
@@ -870,24 +804,27 @@ def process_camera():
                 }
                 
                 y_offset = 0
-                
                 for name, (a, b, c) in joints.items():
                     a = [a[0] * width, a[1] * height]
                     b = [b[0] * width, b[1] * height]
                     c = [c[0] * width, c[1] * height]
-                    
                     angle = calculate_angle(a, b, c)
                     calculated_angles[name] = angle
-                    feedback, color = avaliar_angulo(name, angle)
-                    
+                    feedback, color = avaliar_angulo(angle, angle, name, exercicio_atual, etapa_atual)
                     draw_angle(frame, b, angle, feedback, color=color, y_offset=y_offset)
                     y_offset += 30
-                
+                    # Guardar feedbacks principais para agachamento
+                    if exercicio_atual == "Agachamento":
+                        if name == "Quadril" or name == "Tronco" or "Ombro" in name:
+                            main_feedbacks.append(feedback)
                 # Calcular pontuação
                 pontuacao = calcular_pontuacao(calculated_angles, reference_values)
-                
                 # Desenhar informações de referência
                 draw_reference_pose(frame, reference_values, calculated_angles)
+            # Exibir feedbacks principais no topo da tela
+            if main_feedbacks:
+                for i, fb in enumerate(main_feedbacks):
+                    cv2.putText(frame, fb, (20, 40 + i*35), (cv2.FONT_HERSHEY_SIMPLEX), 1.1, (0, 255, 255), 3)
             
             # Renderizar modelo 3D ou usar boneco de palito como fallback
             try:

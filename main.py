@@ -2,7 +2,10 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 from PIL import Image, ImageTk
 import os
-from pose_analysis import process_image, process_camera, set_exercicio, exercicio_atual
+from pose_analysis import process_image, process_camera, set_exercicio, exercicio_atual, get_reference_pose, create_stick_figure, pontuacao, etapa_atual
+import cv2
+import numpy as np
+from split_screen_app import run_split_screen
 
 INPUT_FOLDER = "input"
 
@@ -105,10 +108,11 @@ tk.Label(exercise_buttons_frame,
 buttons_grid = tk.Frame(exercise_buttons_frame, bg=COLORS["background"])
 buttons_grid.pack()
 
-# Funções para iniciar exercícios
+# Função para iniciar exercício com tela dividida
 def start_exercise(exercise_name):
-    set_exercicio(exercise_name)
-    process_camera()
+    root.withdraw()  # Esconde a janela principal
+    run_split_screen(exercise_name)
+    root.deiconify()  # Mostra a janela principal novamente ao fechar a tela dividida
 
 # Adicionar botões para cada exercício em uma grade de 2x3
 exercises = [
@@ -119,12 +123,8 @@ exercises = [
 for i, exercise in enumerate(exercises):
     row = i // 3
     col = i % 3
-    
-    # Frame para cada botão e seu ícone
     exercise_frame = tk.Frame(buttons_grid, bg=COLORS["background"])
     exercise_frame.grid(row=row, column=col, padx=15, pady=15)
-    
-    # Botão para iniciar o exercício
     btn = create_button(
         exercise_frame,
         exercise,
