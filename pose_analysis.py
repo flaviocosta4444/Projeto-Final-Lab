@@ -733,8 +733,8 @@ def process_camera():
     """
     global etapa_atual, ultimo_tempo_etapa, pontuacao, model_3d, exercicio_atual
     
-    # Inicializar variáveis
-    cap = cv2.VideoCapture(0)
+    # Inicializar variáveis com DirectShow backend
+    cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
     ultimo_tempo_etapa = time.time()
     
     # Obter dimensões da captura

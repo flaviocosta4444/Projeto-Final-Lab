@@ -5,3 +5,5 @@ pillow>=9.0.0
 pygame>=2.0.0
 PyOpenGL>=3.1.0
 PyOpenGL-accelerate>=3.1.0
+
+teste
