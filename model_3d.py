@@ -394,6 +394,30 @@ class Model3D:
                     "Ombro Esquerdo": 150
                 }
         
+        elif exercise == "Jumping Jacks":
+            if stage == 0:  # Posição inicial
+                self.angles = {
+                    "Tronco": 90,
+                    "Quadril": 175,
+                    "Joelho Direito": 175,
+                    "Joelho Esquerdo": 175,
+                    "Cotovelo Direito": 160,
+                    "Cotovelo Esquerdo": 160,
+                    "Ombro Direito": 90,
+                    "Ombro Esquerdo": 90
+                }
+            else:  # Posição com braços e pernas abertos
+                self.angles = {
+                    "Tronco": 90,
+                    "Quadril": 120,
+                    "Joelho Direito": 120,
+                    "Joelho Esquerdo": 120,
+                    "Cotovelo Direito": 175,
+                    "Cotovelo Esquerdo": 175,
+                    "Ombro Direito": 180,
+                    "Ombro Esquerdo": 0
+                }
+        
         elif exercise == "Deadlift":
             if stage == 0:  # Posição inicial
                 self.angles = {

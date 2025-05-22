@@ -2,10 +2,21 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 from PIL import Image, ImageTk
 import os
+import sys
+import traceback
 from pose_analysis import process_image, process_camera, set_exercicio, exercicio_atual, get_reference_pose, create_stick_figure, pontuacao, etapa_atual
 import cv2
 import numpy as np
 from split_screen_app import run_split_screen
+from planos_treino import PlanoTreino, PLANOS_DISPONIVEIS
+
+# Configurar handler de exceções
+def exception_handler(exc_type, exc_value, exc_traceback):
+    error_msg = ''.join(traceback.format_exception(exc_type, exc_value, exc_traceback))
+    print(f"Erro não tratado:\n{error_msg}")
+    messagebox.showerror("Erro", f"Ocorreu um erro inesperado:\n{str(exc_value)}")
+
+sys.excepthook = exception_handler
 
 INPUT_FOLDER = "input"
 
@@ -22,63 +33,8 @@ COLORS = {
     "error": "#e74c3c"       # Vermelho erro
 }
 
-# Janela principal
-root = tk.Tk()
-root.title("Análise de Pose - Sistema de Exercícios")
-root.geometry("800x600")
-root.configure(bg=COLORS["background"])
-
-# Estilo para os widgets
-style = ttk.Style()
-style.configure("Custom.TButton",
-                padding=10,
-                font=("Helvetica", 12),
-                background=COLORS["secondary"])
-
-# Frame principal
-main_frame = tk.Frame(root, bg=COLORS["background"], padx=20, pady=20)
-main_frame.pack(expand=True, fill="both")
-
-# Título
-title_frame = tk.Frame(main_frame, bg=COLORS["background"])
-title_frame.pack(pady=(0, 20))
-
-title_label = tk.Label(title_frame,
-                      text="Sistema de Análise de Exercícios",
-                      font=("Helvetica", 24, "bold"),
-                      fg=COLORS["primary"],
-                      bg=COLORS["background"])
-title_label.pack()
-
-subtitle_label = tk.Label(title_frame,
-                         text="Siga o modelo para realizar o exercício corretamente",
-                         font=("Helvetica", 14),
-                         fg=COLORS["text"],
-                         bg=COLORS["background"])
-subtitle_label.pack(pady=(5, 0))
-
-# Descrição da nova funcionalidade
-description_frame = tk.Frame(main_frame, bg=COLORS["background"])
-description_frame.pack(pady=20)
-
-description_text = """
-Este sistema agora mostra um modelo 3D de referência em vista lateral que você deve seguir.
-Na tela dividida, você verá sua pose à esquerda e o modelo 3D a seguir à direita.
-Tente imitar a pose do modelo para obter uma pontuação alta!
-O modelo 3D proporciona uma melhor visualização da forma correta do exercício.
-"""
-
-description_label = tk.Label(description_frame,
-                            text=description_text,
-                            font=("Helvetica", 12),
-                            fg=COLORS["text"],
-                            bg=COLORS["background"],
-                            justify=tk.LEFT,
-                            wraplength=600)
-description_label.pack()
-
-# Function to create styled buttons
 def create_button(parent, text, command):
+    """Função para criar botões estilizados"""
     btn = tk.Button(parent,
                    text=text,
                    command=command,
@@ -93,176 +49,185 @@ def create_button(parent, text, command):
                    cursor="hand2")
     return btn
 
-# Frame para os botões de exercícios
-exercise_buttons_frame = tk.Frame(main_frame, bg=COLORS["background"])
-exercise_buttons_frame.pack(pady=20)
+def init_application():
+    """Inicializa a aplicação com tratamento de erros"""
+    try:
+        # Janela principal
+        root = tk.Tk()
+        root.title("Análise de Pose - Sistema de Exercícios")
+        root.geometry("1200x800")
+        root.configure(bg=COLORS["background"])
 
-# Título para os botões de exercícios
-tk.Label(exercise_buttons_frame,
-        text="Selecione um Exercício para Iniciar:",
-        font=("Helvetica", 14, "bold"),
-        fg=COLORS["primary"],
-        bg=COLORS["background"]).pack(pady=(0, 10))
+        # Estilo para os widgets
+        style = ttk.Style()
+        style.configure("Custom.TButton",
+                        padding=10,
+                        font=("Helvetica", 12),
+                        background=COLORS["secondary"])
 
-# Grid para organizar os botões de exercícios
-buttons_grid = tk.Frame(exercise_buttons_frame, bg=COLORS["background"])
-buttons_grid.pack()
+        # Frame principal dividido em duas partes
+        main_frame = tk.Frame(root, bg=COLORS["background"], padx=20, pady=20)
+        main_frame.pack(expand=True, fill="both")
 
-# Função para iniciar exercício com tela dividida
-def start_exercise(exercise_name):
-    root.withdraw()  # Esconde a janela principal
-    run_split_screen(exercise_name)
-    root.deiconify()  # Mostra a janela principal novamente ao fechar a tela dividida
+        # Criar frames para esquerda e direita
+        left_frame = tk.Frame(main_frame, bg=COLORS["background"], width=600)
+        left_frame.pack(side=tk.LEFT, fill="both", expand=True, padx=(0, 10))
 
-# Adicionar botões para cada exercício em uma grade de 2x3
-exercises = [
-    "Agachamento", "Flexao", "Prancha",
-    "Lunge", "Deadlift", "Shoulder Press"
-]
+        right_frame = tk.Frame(main_frame, bg=COLORS["background"], width=600)
+        right_frame.pack(side=tk.RIGHT, fill="both", expand=True, padx=(10, 0))
 
-for i, exercise in enumerate(exercises):
-    row = i // 3
-    col = i % 3
-    exercise_frame = tk.Frame(buttons_grid, bg=COLORS["background"])
-    exercise_frame.grid(row=row, column=col, padx=15, pady=15)
-    btn = create_button(
-        exercise_frame,
-        exercise,
-        lambda ex=exercise: start_exercise(ex)
-    )
-    btn.pack()
+        # Título para a seção de exercícios (lado esquerdo)
+        title_frame_left = tk.Frame(left_frame, bg=COLORS["background"])
+        title_frame_left.pack(pady=(0, 20))
 
-# Frame para os botões de análise de imagem
-image_analysis_frame = tk.Frame(main_frame, bg=COLORS["background"])
-image_analysis_frame.pack(pady=20)
+        title_label_left = tk.Label(title_frame_left,
+                            text="Exercícios Disponíveis",
+                            font=("Helvetica", 24, "bold"),
+                            fg=COLORS["primary"],
+                            bg=COLORS["background"])
+        title_label_left.pack()
 
-def process_image_gui():
-    # Abrir diálogo para selecionar exercício primeiro
-    exercise_select = tk.Toplevel(root)
-    exercise_select.title("Selecione o Exercício")
-    exercise_select.geometry("300x300")
-    exercise_select.configure(bg=COLORS["background"])
-    
-    tk.Label(exercise_select,
-            text="Selecione o exercício para análise:",
-            font=("Helvetica", 12),
-            fg=COLORS["text"],
-            bg=COLORS["background"]).pack(pady=10)
-    
-    for exercise in exercises:
-        btn = tk.Button(
-            exercise_select,
-            text=exercise,
-            command=lambda ex=exercise: select_and_open_image(ex, exercise_select),
-            font=("Helvetica", 12),
-            bg=COLORS["secondary"],
-            fg=COLORS["white"],
-            activebackground=COLORS["primary"],
-            activeforeground=COLORS["white"],
-            relief=tk.FLAT,
-            padx=20,
-            pady=5,
-            cursor="hand2"
-        )
-        btn.pack(pady=5)
+        # Título para a seção de planos de treino (lado direito)
+        title_frame_right = tk.Frame(right_frame, bg=COLORS["background"])
+        title_frame_right.pack(pady=(0, 20))
 
-def select_and_open_image(selected_exercise, window):
-    window.destroy()
-    set_exercicio(selected_exercise)
-    
-    if not os.path.exists(INPUT_FOLDER):
-        messagebox.showerror("Erro", f"A pasta '{INPUT_FOLDER}' não existe.")
-        return
+        title_label_right = tk.Label(title_frame_right,
+                            text="Planos de Treino",
+                            font=("Helvetica", 24, "bold"),
+                            fg=COLORS["primary"],
+                            bg=COLORS["background"])
+        title_label_right.pack()
 
-    images = [f for f in os.listdir(INPUT_FOLDER) if f.lower().endswith((".jpg", ".jpeg", ".png"))]
-    if not images:
-        messagebox.showinfo("Sem imagens", f"Nenhuma imagem encontrada na pasta '{INPUT_FOLDER}'.")
-        return
+        # Frame para os botões de exercícios (lado esquerdo)
+        exercise_buttons_frame = tk.Frame(left_frame, bg=COLORS["background"])
+        exercise_buttons_frame.pack(pady=20)
 
-    top = tk.Toplevel(root)
-    top.title("Seleciona uma imagem")
-    top.configure(bg=COLORS["background"])
+        # Grid para organizar os botões de exercícios
+        buttons_grid = tk.Frame(exercise_buttons_frame, bg=COLORS["background"])
+        buttons_grid.pack()
 
-    # Frame para o título
-    title_frame = tk.Frame(top, bg=COLORS["background"])
-    title_frame.pack(pady=10)
-    
-    tk.Label(title_frame,
-            text=f"Selecione uma imagem para análise de {selected_exercise}",
-            font=("Helvetica", 14),
-            fg=COLORS["primary"],
-            bg=COLORS["background"]).pack()
+        # Função para iniciar exercício com tela dividida
+        def start_exercise(exercise_name):
+            try:
+                # Armazenar referência da janela principal
+                tk.Tk.root = root
+                root.withdraw()
+                run_split_screen(exercise_name)
+                root.deiconify()
+            except Exception as e:
+                messagebox.showerror("Erro", f"Erro ao iniciar exercício: {str(e)}")
+                root.deiconify()
 
-    # Frame para o canvas e scrollbar
-    canvas_frame = tk.Frame(top, bg=COLORS["background"])
-    canvas_frame.pack(fill=tk.BOTH, expand=True, padx=20, pady=10)
+        # Adicionar botões para cada exercício em uma grade de 2x3
+        exercises = [
+            "Agachamento", "Flexao", "Prancha",
+            "Lunge", "Jumping Jacks", "Shoulder Press"
+        ]
 
-    canvas = tk.Canvas(canvas_frame, bg=COLORS["background"])
-    canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        for i, exercise in enumerate(exercises):
+            row = i // 3
+            col = i % 3
+            exercise_frame = tk.Frame(buttons_grid, bg=COLORS["background"])
+            exercise_frame.grid(row=row, column=col, padx=15, pady=15)
+            btn = create_button(
+                exercise_frame,
+                exercise,
+                lambda ex=exercise: start_exercise(ex)
+            )
+            btn.pack()
 
-    scrollbar = ttk.Scrollbar(canvas_frame, command=canvas.yview)
-    scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-    canvas.configure(yscrollcommand=scrollbar.set)
+        # Frame para os planos de treino (lado direito)
+        workout_plans_frame = tk.Frame(right_frame, bg=COLORS["background"])
+        workout_plans_frame.pack(pady=20)
 
-    frame = tk.Frame(canvas, bg=COLORS["background"])
-    canvas.create_window((0, 0), window=frame, anchor='nw')
+        # Lista de planos de treino
+        plans_listbox = tk.Listbox(workout_plans_frame, 
+                                font=("Helvetica", 12),
+                                bg=COLORS["white"],
+                                fg=COLORS["text"],
+                                selectbackground=COLORS["secondary"],
+                                height=10)
+        plans_listbox.pack(fill="both", expand=True, pady=10)
 
-    def on_image_click(image_path):
-        top.destroy()
-        process_image(image_path)
+        # Adicionar planos de treino à lista
+        for plan_name in PLANOS_DISPONIVEIS.keys():
+            plans_listbox.insert(tk.END, plan_name)
 
-    # Grid para as imagens
-    row = 0
-    col = 0
-    for img_name in images:
-        img_path = os.path.join(INPUT_FOLDER, img_name)
-        try:
-            pil_image = Image.open(img_path).resize((200, 200))
-            photo = ImageTk.PhotoImage(pil_image)
-            
-            # Frame para cada imagem
-            img_frame = tk.Frame(frame, bg=COLORS["background"])
-            img_frame.grid(row=row, column=col, padx=10, pady=10)
-            
-            img_btn = tk.Button(img_frame,
-                              image=photo,
-                              command=lambda p=img_path: on_image_click(p),
-                              relief=tk.FLAT,
-                              cursor="hand2")
-            img_btn.image = photo
-            img_btn.pack()
-            
-            # Nome do arquivo
-            tk.Label(img_frame,
-                    text=img_name,
-                    font=("Helvetica", 10),
-                    fg=COLORS["text"],
-                    bg=COLORS["background"]).pack()
-            
-            col += 1
-            if col > 2:  # 3 imagens por linha
-                col = 0
-                row += 1
-                
-        except Exception as e:
-            print(f"[ERRO] Não foi possível carregar a imagem {img_path}: {e}")
+        # Frame para detalhes do plano selecionado
+        plan_details_frame = tk.Frame(workout_plans_frame, bg=COLORS["background"])
+        plan_details_frame.pack(fill="both", expand=True, pady=10)
 
-    frame.update_idletasks()
-    canvas.config(scrollregion=canvas.bbox("all"))
+        plan_details_text = tk.Text(plan_details_frame,
+                                font=("Helvetica", 12),
+                                bg=COLORS["white"],
+                                fg=COLORS["text"],
+                                height=10,
+                                wrap=tk.WORD)
+        plan_details_text.pack(fill="both", expand=True)
 
-# Botão para análise de imagem
-btn_image = create_button(image_analysis_frame, "Analisar Imagem", process_image_gui)
-btn_image.pack()
+        def show_plan_details(event):
+            try:
+                selection = plans_listbox.curselection()
+                if selection:
+                    plan_name = plans_listbox.get(selection[0])
+                    plan = PlanoTreino(plan_name, PLANOS_DISPONIVEIS[plan_name])
+                    
+                    # Limpar e atualizar detalhes
+                    plan_details_text.delete(1.0, tk.END)
+                    plan_details_text.insert(tk.END, f"Plano: {plan_name}\n\n")
+                    plan_details_text.insert(tk.END, "Exercícios:\n")
+                    for i, exercise in enumerate(plan.exercicios, 1):
+                        plan_details_text.insert(tk.END, f"{i}. {exercise}\n")
+            except Exception as e:
+                messagebox.showerror("Erro", f"Erro ao mostrar detalhes do plano: {str(e)}")
 
-# Footer
-footer_frame = tk.Frame(main_frame, bg=COLORS["background"])
-footer_frame.pack(side=tk.BOTTOM, pady=20)
+        # Vincular evento de seleção à função
+        plans_listbox.bind('<<ListboxSelect>>', show_plan_details)
 
-tk.Label(footer_frame,
-        text="Sistema de Análise de Exercícios © 2025",
-        font=("Helvetica", 10),
-        fg=COLORS["text"],
-        bg=COLORS["background"]).pack()
+        # Botão para iniciar plano de treino selecionado
+        def start_selected_plan():
+            try:
+                selection = plans_listbox.curselection()
+                if selection:
+                    plan_name = plans_listbox.get(selection[0])
+                    plan = PlanoTreino(plan_name, PLANOS_DISPONIVEIS[plan_name])
+                    # Armazenar referência da janela principal
+                    tk.Tk.root = root
+                    root.withdraw()
+                    run_split_screen(plan.exercicio_atual(), plan)
+                    root.deiconify()
+                else:
+                    messagebox.showwarning("Aviso", "Por favor, selecione um plano de treino.")
+            except Exception as e:
+                messagebox.showerror("Erro", f"Erro ao iniciar plano: {str(e)}")
+                root.deiconify()
+
+        start_plan_button = create_button(workout_plans_frame,
+                                        "Iniciar Plano Selecionado",
+                                        start_selected_plan)
+        start_plan_button.pack(pady=10)
+
+        # Footer
+        footer_frame = tk.Frame(main_frame, bg=COLORS["background"])
+        footer_frame.pack(side=tk.BOTTOM, pady=20)
+
+        tk.Label(footer_frame,
+                text="Sistema de Análise de Exercícios © 2025",
+                font=("Helvetica", 10),
+                fg=COLORS["text"],
+                bg=COLORS["background"]).pack()
+
+        return root
+
+    except Exception as e:
+        messagebox.showerror("Erro de Inicialização", 
+                           f"Erro ao inicializar a aplicação:\n{str(e)}")
+        sys.exit(1)
 
 if __name__ == "__main__":
-    root.mainloop()
+    try:
+        root = init_application()
+        root.mainloop()
+    except Exception as e:
+        print(f"Erro fatal: {str(e)}")
+        sys.exit(1)

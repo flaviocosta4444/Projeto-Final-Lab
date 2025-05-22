@@ -232,6 +232,28 @@ def get_reference_pose():
                 "Ombro Esquerdo": 90
             }
         ],
+        "Jumping Jacks": [
+            {  # Etapa 0: Posição inicial
+                "Joelho Direito": 175,
+                "Joelho Esquerdo": 175,
+                "Quadril": 175,
+                "Tronco": 90,
+                "Cotovelo Direito": 160,
+                "Cotovelo Esquerdo": 160,
+                "Ombro Direito": 90,
+                "Ombro Esquerdo": 90
+            },
+            {  # Etapa 1: Posição com braços e pernas abertos
+                "Joelho Direito": 120,
+                "Joelho Esquerdo": 120,
+                "Quadril": 120,
+                "Tronco": 90,
+                "Cotovelo Direito": 175,
+                "Cotovelo Esquerdo": 175,
+                "Ombro Direito": 180,
+                "Ombro Esquerdo": 0
+            }
+        ],
         "Deadlift": [
             {  # Etapa 0: Posição inicial
                 "Joelho Direito": 175,
