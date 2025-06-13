@@ -48,6 +48,18 @@ CRITICAL_LANDMARKS = [
     mp_pose.PoseLandmark.RIGHT_WRIST
 ]
 
+def draw_rounded_box(img, top_left, bottom_right, color, radius=30, thickness=-1, alpha=1.0):
+    overlay = img.copy()
+    x1, y1 = top_left
+    x2, y2 = bottom_right
+    cv2.rectangle(overlay, (x1 + radius, y1), (x2 - radius, y2), color, thickness)
+    cv2.rectangle(overlay, (x1, y1 + radius), (x2, y2 - radius), color, thickness)
+    cv2.circle(overlay, (x1 + radius, y1 + radius), radius, color, thickness)
+    cv2.circle(overlay, (x2 - radius, y1 + radius), radius, color, thickness)
+    cv2.circle(overlay, (x1 + radius, y2 - radius), radius, color, thickness)
+    cv2.circle(overlay, (x2 - radius, y2 - radius), radius, color, thickness)
+    cv2.addWeighted(overlay, alpha, img, 1 - alpha, 0, img)
+
 def clean_text_for_display(text):
     """
     Remove acentos e caracteres especiais de uma string para exibição no OpenCV.
@@ -1021,10 +1033,10 @@ def analyze_video(video_path, exercise_name):
     # Variáveis para análise
     frame_count = 0
     total_score = 0
-    feedback_history_video = [] # Renomeado para evitar conflito
+    feedback_history_video = []
 
-    # Sistema de feedback em tempo real (para vídeo)
-    feedback_system_video = {
+    # Sistema de feedback em tempo real
+    feedback_system = {
         'current_feedback': [],
         'feedback_history': [],
         'score': 0,
@@ -1035,69 +1047,21 @@ def analyze_video(video_path, exercise_name):
         'feedback_threshold': 3     # Número mínimo de frames com o mesmo feedback para exibi-lo
     }
 
-    def update_feedback_system_video(frame_feedbacks, landmarks):
-        current_time = time.time()
+    def update_feedback_system(frame_feedbacks, landmarks):
+        if not landmarks:
+            return "Posicao nao detectada claramente. Ajuste sua posicao."
         
-        # Verificar confiança da detecção apenas para landmarks críticas do lado visível
-        if landmarks:
-            visible_side = get_visible_side(landmarks) # Determine o lado visível
-            critical_visibility = []
-
-            for lm_idx_enum in CRITICAL_LANDMARKS:
-                lm_idx = lm_idx_enum.value
-                # Se o lado não for 'both', ignore landmarks do lado oculto
-                if visible_side == "left" and "RIGHT" in lm_idx_enum.name:
-                    continue
-                if visible_side == "right" and "LEFT" in lm_idx_enum.name:
-                    continue
-
-                if lm_idx < len(landmarks.landmark):
-                    critical_visibility.append(landmarks.landmark[lm_idx].visibility)
-            
-            if critical_visibility:
-                # Usar a média das visibilidades das landmarks críticas visíveis
-                confidence = sum(critical_visibility) / len(critical_visibility)
-            else:
-                confidence = 0.0 # Sem landmarks críticas detectadas no lado visível
-
-            if confidence < feedback_system_video['min_confidence']:
-                return clean_text_for_display("Posicao nao detectada claramente. Ajuste sua posicao.")
-        
-        # Atualizar histórico de feedback
-        if frame_feedbacks:
-            feedback_system_video['feedback_history'].append(frame_feedbacks[0])
-            # Manter apenas os últimos 30 feedbacks
-            feedback_system_video['feedback_history'] = feedback_system_video['feedback_history'][-30:]
-        
-        # Verificar se passou tempo suficiente desde o último feedback
-        if current_time - feedback_system_video['last_feedback_time'] < feedback_system_video['feedback_cooldown']:
+        if not frame_feedbacks:
             return None
         
-        # Contar ocorrências do feedback mais recente
-        if feedback_system_video['feedback_history']:
-            recent_feedback = feedback_system_video['feedback_history'][-1]
-            count = feedback_system_video['feedback_history'].count(recent_feedback)
-            
-            # Se o feedback se repetiu várias vezes, exibi-lo
-            if count >= feedback_system_video['feedback_threshold']:
-                feedback_system_video['last_feedback_time'] = current_time
-                return recent_feedback
+        # Retornar o primeiro feedback não vazio
+        for feedback in frame_feedbacks:
+            if feedback and feedback.strip():
+                return feedback
         
         return None
 
-    def draw_rounded_box(img, top_left, bottom_right, color, radius=30, thickness=-1, alpha=1.0):
-        overlay = img.copy()
-        x1, y1 = top_left
-        x2, y2 = bottom_right
-        cv2.rectangle(overlay, (x1 + radius, y1), (x2 - radius, y2), color, thickness)
-        cv2.rectangle(overlay, (x1, y1 + radius), (x2, y2 - radius), color, thickness)
-        cv2.circle(overlay, (x1 + radius, y1 + radius), radius, color, thickness)
-        cv2.circle(overlay, (x2 - radius, y1 + radius), radius, color, thickness)
-        cv2.circle(overlay, (x1 + radius, y2 - radius), radius, color, thickness)
-        cv2.circle(overlay, (x2 - radius, y2 - radius), radius, color, thickness)
-        cv2.addWeighted(overlay, alpha, img, 1 - alpha, 0, img)
-
-    def draw_feedback_box_video(frame, feedback, position, color):
+    def draw_feedback_box(frame, feedback, position, color):
         if not feedback:
             return
         
@@ -1105,45 +1069,145 @@ def analyze_video(video_path, exercise_name):
         font = cv2.FONT_HERSHEY_SIMPLEX
         font_scale = 0.7
         thickness = 2
-        padding = 10
+        padding = 15
+        max_box_width = frame.shape[1] - 100  # Margem maior para evitar corte
         
-        # Calcular tamanho do texto
-        (text_width, text_height), _ = cv2.getTextSize(feedback, font, font_scale, thickness)
+        # Quebrar o texto em múltiplas linhas se necessário
+        words = feedback.split()
+        lines = []
+        current_line = ""
+        for word in words:
+            test_line = current_line + (" " if current_line else "") + word
+            (w, h), _ = cv2.getTextSize(test_line, font, font_scale, thickness)
+            if w + 2 * padding > max_box_width and current_line:
+                lines.append(current_line)
+                current_line = word
+            else:
+                current_line = test_line
+        if current_line:
+            lines.append(current_line)
         
-        # Calcular posição da caixa
+        # Calcular tamanho da caixa
+        text_width = max([cv2.getTextSize(line, font, font_scale, thickness)[0][0] for line in lines])
+        text_height = cv2.getTextSize(lines[0], font, font_scale, thickness)[0][1]
+        box_width = min(text_width + 2 * padding, max_box_width)
+        box_height = len(lines) * (text_height + 10) + 2 * padding
+        
         x, y = position
-        box_width = text_width + 2 * padding
-        box_height = text_height + 2 * padding
         
-        # Desenhar caixa com cantos arredondados
+        # Desenhar caixa com cantos arredondados e sombra
+        shadow_offset = 3
+        draw_rounded_box(frame, 
+                        (x + shadow_offset, y - box_height + shadow_offset), 
+                        (x + box_width + shadow_offset, y + shadow_offset), 
+                        (0, 0, 0), 
+                        radius=20, 
+                        alpha=0.3)
         draw_rounded_box(frame, 
                         (x, y - box_height), 
                         (x + box_width, y), 
                         color, 
                         radius=20, 
-                        alpha=0.8)
+                        alpha=0.9)
         
-        # Desenhar texto
-        cv2.putText(frame, 
-                   feedback, 
-                   (x + padding, y - padding), 
-                   font, 
-                   font_scale, 
-                   (255, 255, 255), 
-                   thickness, 
-                   cv2.LINE_AA)
+        # Desenhar texto linha a linha
+        text_x = x + padding
+        text_y = y - box_height + padding + text_height
+        for line in lines:
+            # Borda do texto
+            for offset_x, offset_y in [(-1,-1), (-1,1), (1,-1), (1,1)]:
+                cv2.putText(frame, 
+                           line, 
+                           (text_x + offset_x, text_y + offset_y), 
+                           font, 
+                           font_scale, 
+                           (0, 0, 0), 
+                           thickness + 1, 
+                           cv2.LINE_AA)
+            # Texto principal
+            cv2.putText(frame, 
+                       line, 
+                       (text_x, text_y), 
+                       font, 
+                       font_scale, 
+                       (255, 255, 255), 
+                       thickness, 
+                       cv2.LINE_AA)
+            text_y += text_height + 10
+
+    def draw_feedback_stack(frame, feedbacks, start_position, color):
+        """
+        Desenha múltiplos feedbacks em uma pilha vertical com espaçamento adequado.
+        """
+        if not feedbacks:
+            return
+        
+        x, y = start_position
+        spacing = 10  # Espaçamento entre caixas de feedback
+        
+        for feedback in feedbacks:
+            draw_feedback_box(frame, feedback, (x, y), color)
+            # Atualizar y para a próxima caixa
+            y -= 60  # Altura da caixa + espaçamento
+
+    def draw_exercise_info(frame, exercise_name, stage, score, position, color):
+        """
+        Desenha as informações do exercício em um painel organizado.
+        """
+        x, y = position
+        padding = 15
+        
+        # Criar lista de informações
+        info_items = [
+            f"Exercicio: {exercise_name}",
+            f"Etapa: {stage}",
+            f"Pontuacao: {score:.2f}"
+        ]
+        
+        # Desenhar cada item
+        for item in info_items:
+            draw_feedback_box(frame, item, (x, y), color)
+            y -= 60
+
+    # --- NOVO: Obter todas as etapas de referência para o exercício ---
+    referencias_dict = {
+        "Agachamento": [
+            {"Joelho Direito": 175, "Joelho Esquerdo": 175, "Quadril": 175, "Tronco": 90, "Cotovelo Direito": 160, "Cotovelo Esquerdo": 160, "Ombro Direito": 0, "Ombro Esquerdo": 0},
+            {"Joelho Direito": 120, "Joelho Esquerdo": 120, "Quadril": 120, "Tronco": 90, "Cotovelo Direito": 160, "Cotovelo Esquerdo": 160, "Ombro Direito": 0, "Ombro Esquerdo": 0},
+            {"Joelho Direito": 90, "Joelho Esquerdo": 90, "Quadril": 90, "Tronco": 90, "Cotovelo Direito": 160, "Cotovelo Esquerdo": 160, "Ombro Direito": 0, "Ombro Esquerdo": 0}
+        ],
+        "Flexao": [
+            {"Cotovelo Direito": 160, "Cotovelo Esquerdo": 160, "Quadril": 170, "Tronco": 0, "Joelho Direito": 170, "Joelho Esquerdo": 170, "Ombro Direito": 180, "Ombro Esquerdo": 0},
+            {"Cotovelo Direito": 120, "Cotovelo Esquerdo": 120, "Quadril": 170, "Tronco": 0, "Joelho Direito": 170, "Joelho Esquerdo": 170, "Ombro Direito": 180, "Ombro Esquerdo": 0},
+            {"Cotovelo Direito": 90, "Cotovelo Esquerdo": 90, "Quadril": 170, "Tronco": 0, "Joelho Direito": 170, "Joelho Esquerdo": 170, "Ombro Direito": 180, "Ombro Esquerdo": 0}
+        ],
+        "Prancha": [
+            {"Cotovelo Direito": 90, "Cotovelo Esquerdo": 90, "Quadril": 170, "Tronco": 0, "Joelho Direito": 175, "Joelho Esquerdo": 175, "Ombro Direito": 180, "Ombro Esquerdo": 0}
+        ],
+        "Lunge": [
+            {"Joelho Direito": 175, "Joelho Esquerdo": 175, "Quadril": 175, "Tronco": 90, "Cotovelo Direito": 160, "Cotovelo Esquerdo": 160, "Ombro Direito": 90, "Ombro Esquerdo": 90},
+            {"Joelho Direito": 90, "Joelho Esquerdo": 165, "Quadril": 120, "Tronco": 90, "Cotovelo Direito": 160, "Cotovelo Esquerdo": 160, "Ombro Direito": 90, "Ombro Esquerdo": 90},
+            {"Joelho Direito": 165, "Joelho Esquerdo": 90, "Quadril": 120, "Tronco": 90, "Cotovelo Direito": 160, "Cotovelo Esquerdo": 160, "Ombro Direito": 90, "Ombro Esquerdo": 90}
+        ],
+        "Jumping Jacks": [
+            {"Joelho Direito": 175, "Joelho Esquerdo": 175, "Quadril": 175, "Tronco": 90, "Cotovelo Direito": 160, "Cotovelo Esquerdo": 160, "Ombro Direito": 90, "Ombro Esquerdo": 90},
+            {"Joelho Direito": 120, "Joelho Esquerdo": 120, "Quadril": 120, "Tronco": 90, "Cotovelo Direito": 175, "Cotovelo Esquerdo": 175, "Ombro Direito": 180, "Ombro Esquerdo": 0}
+        ],
+        "Abdominais": [
+            {"Joelho Direito": 90, "Joelho Esquerdo": 90, "Quadril": 0, "Tronco": 0, "Cotovelo Direito": 90, "Cotovelo Esquerdo": 90, "Ombro Direito": 90, "Ombro Esquerdo": 90},
+            {"Joelho Direito": 90, "Joelho Esquerdo": 90, "Quadril": 45, "Tronco": 45, "Cotovelo Direito": 90, "Cotovelo Esquerdo": 90, "Ombro Direito": 90, "Ombro Esquerdo": 90}
+        ]
+    }
+    etapas_referencia = referencias_dict.get(exercise_name, [])
+    etapa_atual = 0  # Começa na etapa 0
 
     with mp_pose.Pose(min_detection_confidence=0.5, min_tracking_confidence=0.5) as pose:
         while cap.isOpened():
             ret, frame = cap.read()
             if not ret:
                 break
-                
             frame_count += 1
-            
-            # Processar o frame
             results = pose.process(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-            
             if results.pose_landmarks:
                 # Desenhar landmarks
                 mp_drawing.draw_landmarks(frame, results.pose_landmarks, mp_pose.POSE_CONNECTIONS)
@@ -1151,18 +1215,18 @@ def analyze_video(video_path, exercise_name):
                 # Calcular ângulos
                 lm = results.pose_landmarks.landmark
                 joints = {
-                    "Quadril": ([lm[mp_pose.PoseLandmark.LEFT_SHOULDER.value].x, lm[mp_pose.PoseLandmark.LEFT_SHOULDER.value].y], 
-                                [lm[mp_pose.PoseLandmark.LEFT_HIP.value].x, lm[mp_pose.PoseLandmark.LEFT_HIP.value].y], 
-                                [lm[mp_pose.PoseLandmark.LEFT_KNEE.value].x, lm[mp_pose.PoseLandmark.LEFT_KNEE.value].y]),
-                    "Tronco": ([lm[mp_pose.PoseLandmark.LEFT_KNEE.value].x, lm[mp_pose.PoseLandmark.LEFT_KNEE.value].y], 
+                    "Quadril": ([lm[mp_pose.PoseLandmark.LEFT_HIP.value].x, lm[mp_pose.PoseLandmark.LEFT_HIP.value].y], 
+                                [lm[mp_pose.PoseLandmark.RIGHT_HIP.value].x, lm[mp_pose.PoseLandmark.RIGHT_HIP.value].y], 
+                                [lm[mp_pose.PoseLandmark.LEFT_ANKLE.value].x, lm[mp_pose.PoseLandmark.LEFT_ANKLE.value].y]),
+                    "Tronco": ([lm[mp_pose.PoseLandmark.LEFT_SHOULDER.value].x, lm[mp_pose.PoseLandmark.LEFT_SHOULDER.value].y], 
                                [lm[mp_pose.PoseLandmark.LEFT_HIP.value].x, lm[mp_pose.PoseLandmark.LEFT_HIP.value].y], 
-                               [lm[mp_pose.PoseLandmark.LEFT_SHOULDER.value].x, lm[mp_pose.PoseLandmark.LEFT_SHOULDER.value].y]),
-                    "Ombro Direito": ([lm[mp_pose.PoseLandmark.RIGHT_HIP.value].x, lm[mp_pose.PoseLandmark.RIGHT_HIP.value].y], 
+                               [lm[mp_pose.PoseLandmark.RIGHT_HIP.value].x, lm[mp_pose.PoseLandmark.RIGHT_HIP.value].y]),
+                    "Ombro Direito": ([lm[mp_pose.PoseLandmark.RIGHT_ELBOW.value].x, lm[mp_pose.PoseLandmark.RIGHT_ELBOW.value].y], 
                                       [lm[mp_pose.PoseLandmark.RIGHT_SHOULDER.value].x, lm[mp_pose.PoseLandmark.RIGHT_SHOULDER.value].y], 
-                                      [lm[mp_pose.PoseLandmark.RIGHT_ELBOW.value].x, lm[mp_pose.PoseLandmark.RIGHT_ELBOW.value].y]),
-                    "Ombro Esquerdo": ([lm[mp_pose.PoseLandmark.LEFT_HIP.value].x, lm[mp_pose.PoseLandmark.LEFT_HIP.value].y], 
+                                      [lm[mp_pose.PoseLandmark.RIGHT_HIP.value].x, lm[mp_pose.PoseLandmark.RIGHT_HIP.value].y]),
+                    "Ombro Esquerdo": ([lm[mp_pose.PoseLandmark.LEFT_ELBOW.value].x, lm[mp_pose.PoseLandmark.LEFT_ELBOW.value].y], 
                                        [lm[mp_pose.PoseLandmark.LEFT_SHOULDER.value].x, lm[mp_pose.PoseLandmark.LEFT_SHOULDER.value].y], 
-                                       [lm[mp_pose.PoseLandmark.LEFT_ELBOW.value].x, lm[mp_pose.PoseLandmark.LEFT_ELBOW.value].y]),
+                                       [lm[mp_pose.PoseLandmark.LEFT_HIP.value].x, lm[mp_pose.PoseLandmark.LEFT_HIP.value].y]),
                     "Cotovelo Direito": ([lm[mp_pose.PoseLandmark.RIGHT_SHOULDER.value].x, lm[mp_pose.PoseLandmark.RIGHT_SHOULDER.value].y], 
                                          [lm[mp_pose.PoseLandmark.RIGHT_ELBOW.value].x, lm[mp_pose.PoseLandmark.RIGHT_ELBOW.value].y], 
                                          [lm[mp_pose.PoseLandmark.RIGHT_WRIST.value].x, lm[mp_pose.PoseLandmark.RIGHT_WRIST.value].y]),
@@ -1173,15 +1237,9 @@ def analyze_video(video_path, exercise_name):
                                        [lm[mp_pose.PoseLandmark.RIGHT_KNEE.value].x, lm[mp_pose.PoseLandmark.RIGHT_KNEE.value].y], 
                                        [lm[mp_pose.PoseLandmark.RIGHT_ANKLE.value].x, lm[mp_pose.PoseLandmark.RIGHT_ANKLE.value].y]),
                     "Joelho Esquerdo": ([lm[mp_pose.PoseLandmark.LEFT_HIP.value].x, lm[mp_pose.PoseLandmark.LEFT_HIP.value].y], 
-                                        [lm[mp_pose.PoseLandmark.LEFT_KNEE.value].x, lm[mp_pose.PoseLandmark.LEFT_KNEE.value].y], 
-                                        [lm[mp_pose.PoseLandmark.LEFT_ANKLE.value].x, lm[mp_pose.PoseLandmark.LEFT_ANKLE.value].y])
+                                         [lm[mp_pose.PoseLandmark.LEFT_KNEE.value].x, lm[mp_pose.PoseLandmark.LEFT_KNEE.value].y], 
+                                         [lm[mp_pose.PoseLandmark.LEFT_ANKLE.value].x, lm[mp_pose.PoseLandmark.LEFT_ANKLE.value].y])
                 }
-                
-                # Obter ângulos de referência
-                reference_angles = get_reference_pose()
-                
-                # Determinar o lado visível
-                visible_side = get_visible_side(results.pose_landmarks)
                 
                 # Calcular todos os ângulos primeiro
                 calculated_angles = {}
@@ -1191,68 +1249,61 @@ def analyze_video(video_path, exercise_name):
                     c_coord = [c[0] * width, c[1] * height]
                     calculated_angles[name] = calculate_angle(a_coord, b_coord, c_coord)
                 
-                # Aplicar a lógica de copiar ângulos do lado visível para o lado oculto
-                if visible_side == "left":
-                    if "Joelho Esquerdo" in calculated_angles and "Joelho Direito" in calculated_angles:
-                        calculated_angles["Joelho Direito"] = calculated_angles["Joelho Esquerdo"]
-                    if "Quadril Esquerdo" in calculated_angles and "Quadril Direito" in calculated_angles:
-                        calculated_angles["Quadril Direito"] = calculated_angles["Quadril Esquerdo"]
-                    if "Ombro Esquerdo" in calculated_angles and "Ombro Direito" in calculated_angles:
-                        calculated_angles["Ombro Direito"] = calculated_angles["Ombro Esquerdo"]
-                    if "Cotovelo Esquerdo" in calculated_angles and "Cotovelo Direito" in calculated_angles:
-                        calculated_angles["Cotovelo Direito"] = calculated_angles["Cotovelo Esquerdo"]
-                elif visible_side == "right":
-                    if "Joelho Direito" in calculated_angles and "Joelho Esquerdo" in calculated_angles:
-                        calculated_angles["Joelho Esquerdo"] = calculated_angles["Joelho Direito"]
-                    if "Quadril Direito" in calculated_angles and "Quadril Esquerdo" in calculated_angles:
-                        calculated_angles["Quadril Esquerdo"] = calculated_angles["Quadril Direito"]
-                    if "Ombro Direito" in calculated_angles and "Ombro Esquerdo" in calculated_angles:
-                        calculated_angles["Ombro Esquerdo"] = calculated_angles["Ombro Direito"]
-                    if "Cotovelo Direito" in calculated_angles and "Cotovelo Esquerdo" in calculated_angles:
-                        calculated_angles["Cotovelo Esquerdo"] = calculated_angles["Cotovelo Direito"]
+                # --- NOVO: Troca automática de etapa ---
+                # Para cada etapa, calcule a soma das diferenças absolutas dos ângulos
+                min_diff = float('inf')
+                etapa_mais_proxima = etapa_atual
+                for idx, ref_angles in enumerate(etapas_referencia):
+                    diff = 0
+                    for joint, ref_angle in ref_angles.items():
+                        user_angle = calculated_angles.get(joint)
+                        if user_angle is not None:
+                            diff += abs(user_angle - ref_angle)
+                    if diff < min_diff:
+                        min_diff = diff
+                        etapa_mais_proxima = idx
+                if etapa_mais_proxima != etapa_atual:
+                    etapa_atual = etapa_mais_proxima
+                # Usar os ângulos de referência da etapa atual
+                reference_angles = etapas_referencia[etapa_atual] if etapas_referencia else {}
+                
+                # Determinar o lado visível
+                visible_side = get_visible_side(results.pose_landmarks)
                 
                 # Analisar cada articulação com os ângulos ajustados
                 frame_feedbacks = []
-                frame_score = 0
                 for name, angle in calculated_angles.items():
                     reference_angle = reference_angles.get(name, 0)
                     feedback, _ = avaliar_angulo(angle, reference_angle, name, exercise_name, etapa_atual, landmarks=results.pose_landmarks)
                     if feedback:
                         frame_feedbacks.append(feedback)
-                        # O frame_score aqui será a pontuação da articulação, não apenas 1
-                        # Em vez de frame_score, vamos usar o score retornado por calcular_pontuacao
 
                 # Calcular a pontuação do frame usando a função calcular_pontuacao
                 frame_score_calculated = calcular_pontuacao(calculated_angles, reference_angles)
                 
-                # Atualizar pontuação total (acumulando a pontuação calculada por frame)
-                total_score += frame_score_calculated
+                # Atualizar pontuação atual (sem acumular)
+                feedback_system['score'] = frame_score_calculated
                 
-                # Adicionar feedback ao histórico para o resumo final
-                if frame_feedbacks:
-                    feedback_history_video.append(frame_feedbacks[0])
+                # Atualizar sistema de feedback
+                current_feedback = update_feedback_system(frame_feedbacks, results.pose_landmarks)
 
-                # Obter feedback em tempo real do sistema de feedback
-                current_feedback_display = update_feedback_system_video(frame_feedbacks, results.pose_landmarks)
+                # Organizar feedbacks em categorias
+                feedbacks_to_show = []
+                if current_feedback:
+                    feedbacks_to_show.append(current_feedback)
 
-                # Desenhar feedback em tempo real
-                if current_feedback_display:
-                    draw_feedback_box_video(frame, 
-                                            clean_text_for_display(current_feedback_display), 
-                                            (width - 400, 100), 
-                                            TURQUOISE)
-                
-                # Mostrar pontuação atual (usando a função de desenho da caixa)
-                if frame_count > 0:
-                    avg_score = total_score / frame_count
-                    score_text = f"Pontuacao: {avg_score:.2f}"
-                    draw_feedback_box_video(frame, 
-                                            clean_text_for_display(score_text), 
-                                            (width - 200, 50), 
-                                            TURQUOISE)
+                # Desenhar feedbacks organizados (agora acima da pontuação)
+                draw_feedback_stack(frame, feedbacks_to_show, (width - 400, height - 225), TURQUOISE)
 
-                feedback_system_video['frame_count'] = frame_count # Atualizar contador de frames do sistema de feedback
-                feedback_system_video['score'] = total_score # Atualizar pontuação do sistema de feedback
+                # Desenhar informações do exercício
+                draw_exercise_info(frame, 
+                                 exercise_name, 
+                                 etapa_atual, 
+                                 feedback_system['score'],
+                                 (width - 400, height - 50),
+                                 TURQUOISE)
+
+                feedback_system['frame_count'] += 1
 
             # Mostrar o frame
             cv2.imshow("Análise de Exercício", frame)
@@ -1292,7 +1343,7 @@ def analyze_video(video_path, exercise_name):
         
         # Pontuação final
         score_label = tk.Label(summary_window,
-                             text=clean_text_for_display(f"Pontuacao Final: {avg_score:.2f}"),
+                             text=clean_text_for_display(f"Pontuacao Final: {feedback_system['score']:.2f}"),
                              font=("Helvetica", 14),
                              fg="white",
                              bg="#1A6FA3")

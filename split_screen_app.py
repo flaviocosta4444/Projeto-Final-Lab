@@ -1,6 +1,7 @@
 import cv2
 import numpy as np
 import time
+import pose_analysis
 from pose_analysis import create_stick_figure, pontuacao, etapa_atual, exercicio_atual, set_exercicio, avaliar_angulo, calculate_angle, get_visible_side, calcular_pontuacao, extract_angles_from_landmarks
 import mediapipe as mp
 import glob
@@ -168,18 +169,32 @@ def run_split_screen(exercicio, plano_treino=None):
         font_scale = 0.7
         thickness = 2
         padding = 15
-        line_spacing = 10
+        max_box_width = frame.shape[1] - 60  # Margem de 30px de cada lado
         
-        # Calcular tamanho do texto
-        (text_width, text_height), _ = cv2.getTextSize(feedback, font, font_scale, thickness)
+        # Quebrar o texto em múltiplas linhas se necessário
+        words = feedback.split()
+        lines = []
+        current_line = ""
+        for word in words:
+            test_line = current_line + (" " if current_line else "") + word
+            (w, h), _ = cv2.getTextSize(test_line, font, font_scale, thickness)
+            if w + 2 * padding > max_box_width and current_line:
+                lines.append(current_line)
+                current_line = word
+            else:
+                current_line = test_line
+        if current_line:
+            lines.append(current_line)
         
-        # Calcular posição da caixa
+        # Calcular tamanho da caixa
+        text_width = max([cv2.getTextSize(line, font, font_scale, thickness)[0][0] for line in lines])
+        text_height = cv2.getTextSize(lines[0], font, font_scale, thickness)[0][1]
+        box_width = min(text_width + 2 * padding, max_box_width)
+        box_height = len(lines) * (text_height + 10) + 2 * padding
+        
         x, y = position
-        box_width = text_width + 2 * padding
-        box_height = text_height + 2 * padding
         
         # Desenhar caixa com cantos arredondados e sombra
-        # Primeiro desenhar a sombra
         shadow_offset = 3
         draw_rounded_box(frame, 
                         (x + shadow_offset, y - box_height + shadow_offset), 
@@ -187,8 +202,6 @@ def run_split_screen(exercicio, plano_treino=None):
                         (0, 0, 0), 
                         radius=20, 
                         alpha=0.3)
-        
-        # Depois desenhar a caixa principal
         draw_rounded_box(frame, 
                         (x, y - box_height), 
                         (x + box_width, y), 
@@ -196,45 +209,30 @@ def run_split_screen(exercicio, plano_treino=None):
                         radius=20, 
                         alpha=0.9)
         
-        # Desenhar texto com borda para melhor legibilidade
+        # Desenhar texto linha a linha
         text_x = x + padding
-        text_y = y - padding
-        
-        # Desenhar borda do texto
-        for offset_x, offset_y in [(-1,-1), (-1,1), (1,-1), (1,1)]:
+        text_y = y - box_height + padding + text_height
+        for line in lines:
+            # Borda do texto
+            for offset_x, offset_y in [(-1,-1), (-1,1), (1,-1), (1,1)]:
+                cv2.putText(frame, 
+                           line, 
+                           (text_x + offset_x, text_y + offset_y), 
+                           font, 
+                           font_scale, 
+                           (0, 0, 0), 
+                           thickness + 1, 
+                           cv2.LINE_AA)
+            # Texto principal
             cv2.putText(frame, 
-                       feedback, 
-                       (text_x + offset_x, text_y + offset_y), 
+                       line, 
+                       (text_x, text_y), 
                        font, 
                        font_scale, 
-                       (0, 0, 0), 
-                       thickness + 1, 
+                       (255, 255, 255), 
+                       thickness, 
                        cv2.LINE_AA)
-        
-        # Desenhar texto principal
-        cv2.putText(frame, 
-                   feedback, 
-                   (text_x, text_y), 
-                   font, 
-                   font_scale, 
-                   (255, 255, 255), 
-                   thickness, 
-                   cv2.LINE_AA)
-
-    def draw_feedback_stack(frame, feedbacks, start_position, color):
-        """
-        Desenha múltiplos feedbacks em uma pilha vertical com espaçamento adequado.
-        """
-        if not feedbacks:
-            return
-        
-        x, y = start_position
-        spacing = 10  # Espaçamento entre caixas de feedback
-        
-        for feedback in feedbacks:
-            draw_feedback_box(frame, feedback, (x, y), color)
-            # Atualizar y para a próxima caixa
-            y -= 60  # Altura da caixa + espaçamento
+            text_y += text_height + 10
 
     def draw_exercise_info(frame, exercise_name, stage, score, position, color):
         """
@@ -265,9 +263,8 @@ def run_split_screen(exercicio, plano_treino=None):
             main_feedbacks = []
             current_feedback = None # Inicializar current_feedback
 
-            # Sincronizar etapa_atual com o frame de referência
-            import pose_analysis
-            pose_analysis.etapa_atual = frame_idx
+            # Sincronizar etapa_atual com o frame de referência (agora usando o número de imagens de referência)
+            pose_analysis.etapa_atual = (frame_idx // frames_per_image) % num_frames
 
             if not exercicio_iniciado:
                 exercicio_iniciado = True
@@ -313,6 +310,8 @@ def run_split_screen(exercicio, plano_treino=None):
                             cv2.waitKey(2000)
                             exercicio = proximo_exercicio
                             set_exercicio(exercicio)
+                            current_exercicio_name_raw = exercicio[0]
+                            current_exercicio_name = current_exercicio_name_raw.replace("ç", "c").replace("ã", "a").replace("á", "a").replace("é", "e").replace("í", "i").replace("ó", "o").replace("ú", "u").replace("ê", "e").replace("ô", "o").replace("â", "a").replace("õ", "o").replace("Á", "A").replace("É", "E").replace("Í", "I").replace("Ó", "O").replace("Ú", "U").replace("Ç", "C").replace("Ã", "A").replace("Õ", "O")
                             frames = load_exercise_frames(exercicio[0], width, height) # Pass only the name
                             num_frames = len(frames)
                             frame_idx = 0
@@ -435,8 +434,8 @@ def run_split_screen(exercicio, plano_treino=None):
                     # Usar o reference_angle do frame atual do modelo de referência
                     ref_angle_for_joint = reference_angles.get(name, None)
                     if ref_angle_for_joint is not None:
-                        feedback, _ = avaliar_angulo(angle, ref_angle_for_joint, name, exercicio, etapa_atual, landmarks=results.pose_landmarks)
-                    if feedback:
+                        feedback, _ = avaliar_angulo(angle, ref_angle_for_joint, name, current_exercicio_name, etapa_atual, landmarks=results.pose_landmarks)
+                        if feedback:
                             frame_feedbacks.append(feedback)
 
                 # Calcular a pontuação do frame usando a função calcular_pontuacao
@@ -453,13 +452,10 @@ def run_split_screen(exercicio, plano_treino=None):
                 if current_feedback:
                     feedbacks_to_show.append(current_feedback)
 
-                # Desenhar feedbacks organizados
-                draw_feedback_stack(frame, feedbacks_to_show, (width - 400, height - 200), TURQUOISE)
-
                 # Desenhar informações do exercício
                 draw_exercise_info(frame, 
                                  current_exercicio_name, 
-                                 frame_idx, 
+                                 pose_analysis.etapa_atual, 
                                  feedback_system['score'],
                                  (width - 400, height - 50),
                                  TURQUOISE)
@@ -474,15 +470,26 @@ def run_split_screen(exercicio, plano_treino=None):
             put_text_with_bg(frame, clean_text_for_display("Exercicio Atual:"), (30, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), TURQUOISE, thickness=2, pad_x=0, pad_y=0, radius=0, alpha=0)
             put_text_with_bg(frame, clean_text_for_display(current_exercicio_name), (30, 80), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), TURQUOISE, thickness=3, pad_x=0, pad_y=0, radius=0, alpha=0)
 
-            # Caixa topo direito: Feedback
-            if current_feedback:
-                # Ajustar largura do retângulo de feedback conforme o tamanho do texto
-                max_fb_w = min(600, width - 60)  # nunca maior que a tela
+            # Caixa do tempo logo abaixo do nome do exercício (apenas se estiver em plano de treino)
+            if plano_treino is not None:
+                tbox_w = box_w
+                tbox_h = 60
+                y_offset = box_h + 10
+                draw_rounded_box(frame, (0, y_offset), (tbox_w, y_offset + tbox_h), TURQUOISE, radius=30, alpha=0.95)
+                if exercicio_iniciado and not exercicio_concluido:
+                    tempo_restante = max(0, tempo_duracao - int(time.time() - tempo_inicio))
+                put_text_with_bg(frame, clean_text_for_display(f"Tempo restante: {tempo_restante} seg"), (30, y_offset + 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), TURQUOISE, thickness=2, pad_x=0, pad_y=0, radius=0, alpha=0)
+
+            # Caixa topo direito: Feedback (sempre exibir)
+            feedback_to_show = current_feedback
+            if feedback_to_show is None and not results.pose_landmarks:
+                feedback_to_show = "Postura nao reconhecida"
+            if feedback_to_show:
+                max_fb_w = min(600, width - 60)
                 font = cv2.FONT_HERSHEY_SIMPLEX
                 font_scale = 1
                 thickness = 2
-                feedback_msg_to_display = clean_text_for_display(current_feedback)
-                # Quebrar o texto em múltiplas linhas se necessário
+                feedback_msg_to_display = clean_text_for_display(feedback_to_show)
                 words = feedback_msg_to_display.split()
                 lines = []
                 current_line_text = ""
@@ -504,7 +511,6 @@ def run_split_screen(exercicio, plano_treino=None):
                 x2 = width - 30
                 y2 = 30 + fb_h
                 draw_rounded_box(frame, (x1, y1), (x2, y2), TURQUOISE, radius=30, alpha=0.95)
-                # Escrever cada linha do feedback
                 for i, line in enumerate(lines):
                     put_text_with_bg(frame, line, (x1 + 80, y1 + 40 + i * 40), font, font_scale, (255, 255, 255), TURQUOISE, thickness=thickness, pad_x=0, pad_y=0, radius=0, alpha=0)
 
@@ -533,17 +539,6 @@ def run_split_screen(exercicio, plano_treino=None):
             if texto_y > height - 10:
                 texto_y = height - 10
             put_text_with_bg(frame, clean_text_for_display("Modelo de Referencia"), (model_x + 10, texto_y), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), TURQUOISE, thickness=2, pad_x=0, pad_y=0, radius=0, alpha=0)
-
-            # Caixa canto inferior direito: Tempo restante (apenas se estiver em plano de treino)
-            if plano_treino is not None:
-                tbox_w = 350
-                tbox_h = 60
-                draw_rounded_box(frame, (width - tbox_w - 30, height - tbox_h - 30), (width - 30, height - 30), TURQUOISE, radius=30, alpha=0.95)
-                
-                if exercicio_iniciado and not exercicio_concluido:
-                    tempo_restante = max(0, tempo_duracao - int(time.time() - tempo_inicio))
-                
-                put_text_with_bg(frame, clean_text_for_display(f"Tempo restante: {tempo_restante} seg"), (width - tbox_w, height - 45), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), TURQUOISE, thickness=2, pad_x=0, pad_y=0, radius=0, alpha=0)
 
             cv2.imshow("Exercício", frame)
 

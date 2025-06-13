@@ -81,7 +81,7 @@ def init_application():
         # Grid de botões de exercícios
         exercises = [
             "Agachamento", "Flexao", "Prancha",
-            "Prancha", "Jumping Jacks", "Lunge",
+            "Jumping Jacks", "Lunge",
             "Abdominais"
         ]
         grid_frame = tk.Frame(left_frame, bg=COLORS["background"])
