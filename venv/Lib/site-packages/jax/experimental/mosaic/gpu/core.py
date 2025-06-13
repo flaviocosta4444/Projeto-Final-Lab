@@ -18,7 +18,6 @@ import contextlib
 import ctypes
 import dataclasses
 import enum
-import functools
 import hashlib
 import math
 import os
@@ -40,6 +39,7 @@ from jaxlib.mlir.dialects import llvm
 from jaxlib.mlir.dialects import memref
 from jaxlib.mlir.dialects import nvvm
 import numpy as np
+
 
 # mypy: ignore-errors
 
@@ -83,15 +83,33 @@ if RUNTIME_PATH and RUNTIME_PATH.exists():
   # Set this so that the custom call can find it
   os.environ["MOSAIC_GPU_RUNTIME_LIB_PATH"] = str(RUNTIME_PATH)
 
-if os.environ.get("MOSAIC_GPU_NVSHMEM_LLVM_LIB_PATH") is None:
-  try:
-    from nvidia import nvshmem
-  except ImportError:
-    pass
-  else:
-    os.environ["MOSAIC_GPU_NVSHMEM_LLVM_LIB_PATH"] = (
-      os.path.join(nvshmem.__path__[0], 'lib/libnvshmem_device.bc')
+
+try:
+  from nvidia import nvshmem
+except ImportError:
+  pass
+else:
+  if os.environ.get("MOSAIC_GPU_NVSHMEM_BC_PATH") is None:
+    os.environ["MOSAIC_GPU_NVSHMEM_BC_PATH"] = os.path.join(
+        nvshmem.__path__[0], "lib/libnvshmem_device.bc"
     )
+  if os.environ.get("MOSAIC_GPU_NVSHMEM_SO_PATH") is None:
+    os.environ["MOSAIC_GPU_NVSHMEM_SO_PATH"] = os.path.join(
+        nvshmem.__path__[0], "lib/libnvshmem_host.so.3"
+    )
+
+
+def supports_cross_device_collectives():
+  try:
+    nvshmem_bc_path = os.environ["MOSAIC_GPU_NVSHMEM_BC_PATH"]
+  except KeyError:
+    return False
+  xla_flags = os.environ.get("XLA_FLAGS", "")
+  return (
+      os.path.exists(nvshmem_bc_path)
+      and "--xla_gpu_experimental_enable_nvshmem" in xla_flags
+  )
+
 
 mosaic_gpu_p = jax._src.core.Primitive("mosaic_gpu_p")
 mosaic_gpu_p.multiple_results = True
@@ -142,7 +160,7 @@ def _mosaic_gpu_lowering_rule(
         operands=args,
         operand_layouts=[list(reversed(range(a.ndim))) for a in ctx.avals_in],
         result_layouts=[list(reversed(range(a.ndim))) for a in ctx.avals_out],
-        backend_config=kernel_id + module,
+        backend_config=kernel_id + module_asm,
         operand_output_aliases=dict(input_output_aliases),
     )
   else:
@@ -188,6 +206,12 @@ class Barrier:
   arrival_count: int
   num_barriers: int = 1
 
+  def __post_init__(self):
+    if self.arrival_count < 1:
+      raise ValueError(
+          f"Arrival count must be at least 1, but got {self.arrival_count}"
+      )
+
 @dataclasses.dataclass(frozen=True)
 class ClusterBarrier:
   collective_dims: Sequence[gpu.Dimension]
@@ -197,12 +221,16 @@ class ClusterBarrier:
 class TMEM:
   shape: tuple[int, int]
   dtype: Any
+  _: dataclasses.KW_ONLY
   layout: tcgen05.TMEMLayout | None = None
   collective: bool = False
+  packing: int | None = None
 
   def __post_init__(self):
     if self.layout is not None:
-      self.layout.check_shape(self.shape)
+      self.layout.check_type(self.shape, utils.dtype_to_ir_type(self.dtype))
+      if self.packing is not None:
+        raise ValueError("Cannot specify both layout and packing")
 
 
 def _count_buffer_bytes(shape_dtype: jax.ShapeDtypeStruct) -> int:
@@ -216,11 +244,30 @@ class LoweringSemantics(enum.Enum):
   Warpgroup = enum.auto()
 
 
+@dataclasses.dataclass(frozen=True)
+class _TMEMAlloc:
+  addr_ref: ir.Value
+  num_cols: int
+  collective: bool
+
+  def alloc(self):
+    tcgen05.tmem_alloc(
+        self.addr_ref, self.num_cols, collective=self.collective, exact=False
+    )
+
+  def dealloc(self):
+    addr = memref.load(self.addr_ref, [])
+    tcgen05.tmem_dealloc(
+        addr, self.num_cols, collective=self.collective, exact=False
+    )
+
+
 def _construct_smem_reftree(
     cluster_shape: tuple[int, int, int],
     dynamic_smem: ir.Value,
     smem_buffers: ShapeTree,
-    delayed_warp_init: list[Callable[[], None]],  # Mutated by this function!
+    tmem_allocs: list[_TMEMAlloc],  # Mutated by this function!
+    lowering_semantics: LoweringSemantics,
     dynamic_smem_offset: int = 0,
 ) -> Callable[[], RefTree]:
   index = ir.IndexType.get()
@@ -231,6 +278,7 @@ def _construct_smem_reftree(
       smem_buffers, is_leaf=lambda x: isinstance(x, Union)
   )
   smem_refs = []
+
   for ref_ty in flat_ref_tys:
     def get_barrier_ptr(num_barriers: int) -> ir.Value:
       nonlocal dynamic_smem_offset
@@ -242,7 +290,8 @@ def _construct_smem_reftree(
       )
       smem_ptr_ty = ir.Type.parse(f"!llvm.ptr<{workgroup_nvptx_address_space}>")
       barrier_base_ptr = llvm.getelementptr(
-          smem_ptr_ty, smem_base_ptr, [], [dynamic_smem_offset], i8
+          smem_ptr_ty, smem_base_ptr, [], [dynamic_smem_offset], i8,
+          llvm.GEPNoWrapFlags.none
       )
       dynamic_smem_offset += num_barriers * utils.MBARRIER_BYTES
       return barrier_base_ptr
@@ -253,7 +302,8 @@ def _construct_smem_reftree(
                 cluster_shape,
                 dynamic_smem,
                 m,
-                delayed_warp_init,
+                tmem_allocs,
+                lowering_semantics,
                 dynamic_smem_offset,
             )
             for m in members
@@ -265,11 +315,17 @@ def _construct_smem_reftree(
           return Union([t() for t in member_thunks])
 
       case TMABarrier(num_barriers):
-        ref = utils.BarrierRef.initialize(
+        init_fn = utils.DialectBarrierRef.initialize if (
+            lowering_semantics == LoweringSemantics.Warpgroup
+        ) else utils.BarrierRef.initialize
+        ref = init_fn(
             get_barrier_ptr(num_barriers), num_barriers, arrival_count=1
         )
       case Barrier(arrival_count, num_barriers):
-        ref = utils.BarrierRef.initialize(
+        init_fn = utils.DialectBarrierRef.initialize if (
+            lowering_semantics == LoweringSemantics.Warpgroup
+        ) else utils.BarrierRef.initialize
+        ref = init_fn(
             get_barrier_ptr(num_barriers),
             num_barriers,
             arrival_count=arrival_count,
@@ -281,20 +337,17 @@ def _construct_smem_reftree(
             collective_dims,
             cluster_shape,
         )
-      case TMEM(shape, dtype, layout, collective):
+      case TMEM(shape, dtype, layout=layout, collective=collective, packing=packing):
         addr_ref = memref.view(
             ir.MemRefType.get([], i32, memory_space=smem),
             dynamic_smem, c(dynamic_smem_offset, index), [],
         )
         if layout is None:
-          layout = tcgen05._infer_tmem_layout(shape, collective)
+          layout = tcgen05._infer_tmem_layout(
+              shape, collective, 1 if packing is None else packing
+          )
         num_cols = layout.cols_in_shape(shape)
-        delayed_warp_init.append(
-            functools.partial(
-                tcgen05.tmem_alloc,
-                addr_ref, num_cols, collective=collective, exact=False,
-            )
-        )
+        tmem_allocs.append(_TMEMAlloc(addr_ref, num_cols, collective))
         def ref(addr_ref=addr_ref, shape=shape, dtype=dtype, layout=layout):
           addr = memref.load(addr_ref, [])
           return tcgen05.TMEMRef(
@@ -353,8 +406,9 @@ def _launch(
     grid: tuple[int, int, int],
     cluster: tuple[int, int, int],
     block: tuple[int, int, int],
-    scratch_arr,
     smem_buffers: ShapeTree | Union[ShapeTree],
+    lowering_semantics: LoweringSemantics,
+    module: ir.Module,
     profiler_spec: profiler.ProfilerSpec | None = None,
     maybe_prof_buffer: ir.Value | None = None,
 ):
@@ -370,7 +424,13 @@ def _launch(
 
   smem_bytes = user_smem_bytes
   if profiler_spec is not None:
-    smem_bytes += profiler_spec.smem_bytes(block=block)
+    # Profiler array stores values in 64 bit chunks (vectors of size 2
+    # of 32-bit elements), and so the starting address needs to be 64
+    # bit = 8 byte aligned.
+    # https://docs.nvidia.com/cuda/parallel-thread-execution/#addresses-as-operands:~:text=The%20address%20must%20be%20naturally%20aligned%20to%20a%20multiple%20of%20the%20access%20size.
+    align = 8
+    profiler_start = (smem_bytes + align - 1) & ~(align - 1)
+    smem_bytes = profiler_start + profiler_spec.smem_bytes(block=block)
 
   # TODO(cperivol): Query the shared memory size programmatically.
   if smem_bytes > 228 * 1024:
@@ -407,7 +467,7 @@ def _launch(
               (profiler_spec.smem_i32_elements(block=block),),
               i32, memory_space=smem,
           ),
-          dynamic_smem, c(user_smem_bytes, index), [],
+          dynamic_smem, c(profiler_start, index), [],
       )
       prof = profiler.OnDeviceProfiler(
           profiler_spec, prof_smem, maybe_prof_buffer
@@ -415,13 +475,13 @@ def _launch(
     else:
       prof = None
 
-    ptr_ty = ir.Type.parse("!llvm.ptr")
-    scratch_ptr = builtin.unrealized_conversion_cast([ptr_ty], [scratch_arr])
-    ctx = launch_context.LaunchContext(launch_op, scratch_ptr, cluster, prof)
+    ctx = launch_context.LaunchContext(
+        module, launch_context.Scratch(launch_op), cluster, prof
+    )
     with ctx.named_region("Init"):
-      delayed_warp_init = []
+      tmem_allocs: list[_TMEMAlloc] = []
       smem_ref_tree_thunk = _construct_smem_reftree(
-          cluster, dynamic_smem, smem_buffers, delayed_warp_init
+          cluster, dynamic_smem, smem_buffers, tmem_allocs, lowering_semantics
       )
       # TODO(apaszke): Skip fences if no barriers or TMEM is initialized.
       # TODO(apaszke): Only initialize cluster barriers before the cluster wait.
@@ -429,17 +489,26 @@ def _launch(
       if math.prod(cluster) != 1:
         nvvm.cluster_arrive_relaxed(aligned=ir.UnitAttr.get())
         nvvm.cluster_wait(aligned=ir.UnitAttr.get())
-      if delayed_warp_init:
+      if tmem_allocs:
         eq = arith.CmpIPredicate.eq
         is_init_warp = arith.cmpi(eq, utils.warp_idx(sync=False), c(0, i32))
         with utils.when(is_init_warp):
-          for init in delayed_warp_init:
-            init()
-          tcgen05.tmem_relinquish_alloc_permit()
+          for alloc in tmem_allocs:
+            alloc.alloc()
+          if any(alloc.collective for alloc in tmem_allocs):
+            tcgen05.tmem_relinquish_alloc_permit(collective=True)
+          if any(not alloc.collective for alloc in tmem_allocs):
+            tcgen05.tmem_relinquish_alloc_permit(collective=False)
       gpu.barrier()  # Make sure the init is visible to all threads.
       smem_ref_tree = smem_ref_tree_thunk()
 
     yield ctx, smem_ref_tree
+
+    if tmem_allocs:
+      gpu.barrier()  # Make sure everyone is done before we release TMEM.
+      with utils.when(is_init_warp):
+        for alloc in tmem_allocs:
+          alloc.dealloc()
     if prof is not None:
       prof.finalize(grid=grid, block=block)
     gpu.terminator()
@@ -453,6 +522,7 @@ def _lower_as_gpu_kernel(
     in_shapes: tuple[Any, ...],
     out_shape,
     smem_scratch_shape: ShapeTree | Union[ShapeTree],
+    lowering_semantics: LoweringSemantics,
     module_name: str,
     kernel_name: str | None = None,
     prof_spec: profiler.ProfilerSpec | None = None,
@@ -460,7 +530,6 @@ def _lower_as_gpu_kernel(
   ptr_ty = ir.Type.parse("!llvm.ptr")
   token_ty = ir.Type.parse("!gpu.async.token")
   i32 = ir.IntegerType.get_signless(32)
-  i64 = ir.IntegerType.get_signless(64)
 
   def _shape_to_ref_ty(shape: jax.ShapeDtypeStruct) -> ir.MemRefType:
     return ir.MemRefType.get(shape.shape, utils.dtype_to_ir_type(shape.dtype))
@@ -486,7 +555,7 @@ def _lower_as_gpu_kernel(
     kernel_name = getattr(body, "__name__", "anonymous")
 
   # These are needed as nonlocal below.
-  launch_ctx, scratch_arr = None, None
+  launch_ctx = None
   with ir.InsertionPoint(module.body):
     _declare_runtime_functions()
     global_scratch = llvm.GlobalOp(
@@ -497,24 +566,18 @@ def _lower_as_gpu_kernel(
     )
     @func.FuncOp.from_py_func(ptr_ty, ptr_ty, name=f"mosaic_gpu_{kernel_name}")
     def main(token_ptr, buffers):
-      nonlocal launch_ctx, scratch_arr
+      nonlocal launch_ctx
       token = builtin.unrealized_conversion_cast([token_ty], [token_ptr])
       arg_refs = []
       for i, ref_ty in enumerate([*in_ref_tys, *out_ref_tys]):
-        ptr = llvm.LoadOp(ptr_ty, llvm.GEPOp(ptr_ty, buffers, [], [i], ptr_ty))
+        ptr = llvm.LoadOp(ptr_ty, llvm.GEPOp(ptr_ty, buffers, [], [i], ptr_ty, llvm.GEPNoWrapFlags.none))
         arg_refs.append(utils.ptr_as_memref(ptr, ir.MemRefType(ref_ty)))
       in_refs = arg_refs[:len(in_ref_tys)]
       out_refs = arg_refs[len(in_ref_tys):]
       prof_buffer = out_refs.pop() if prof_spec is not None else None
-      empty_arr_ty = ir.Type.parse("!llvm.array<0 x i8>")
-      scratch_alloc = llvm.AllocaOp(
-          ptr_ty, c(1, i64), empty_arr_ty,
-          alignment=launch_context.TMA_DESCRIPTOR_ALIGNMENT
-      )
-      scratch_arr = llvm.load(empty_arr_ty, scratch_alloc.result)
       with _launch(
-          token, grid, cluster, block, scratch_arr, smem_scratch_shape,
-          prof_spec, prof_buffer
+          token, grid, cluster, block, smem_scratch_shape,
+          lowering_semantics, module, prof_spec, prof_buffer
       ) as (_launch_ctx, smem_refs):
         nonlocal launch_ctx
         launch_ctx = _launch_ctx
@@ -525,7 +588,7 @@ def _lower_as_gpu_kernel(
   sym_tab.insert(global_scratch)
   module.operation.verify()
 
-  return module, out_shape, unwrap_output_tuple, launch_ctx, scratch_arr
+  return module, out_shape, unwrap_output_tuple, launch_ctx
 
 
 def _run_serde_pass(
@@ -551,27 +614,6 @@ def _run_serde_pass(
     module.context.allow_unregistered_dialects = allow_unregistered_dialects
   return module
 
-
-def _initialize_scratch(
-    launch_ctx : launch_context.LaunchContext,
-    scratch_arr: ir.Value,
-    ):
-  """
-  Allocates and initializes the host buffer right before the launch. This needs
-  to be done after all TMA descriptors have been recorded by the launch context.
-  Only then we know what the scratch contains.
-
-  When using the Mosaic GPU dialect, the necessary information is known only
-  after the lowering passes have run.
-  """
-  with ir.InsertionPoint(scratch_arr.owner):
-    gmem_scratch_bytes = launch_ctx.next_scratch_offset
-    scratch_alloc_op = scratch_arr.owner.opview.addr.owner.opview
-    scratch_arr_ty = ir.Type.parse(f"!llvm.array<{gmem_scratch_bytes} x i8>")
-    scratch_alloc_op.elem_type = ir.TypeAttr.get(scratch_arr_ty)
-    scratch_arr.set_type(scratch_arr_ty)
-    for init_callback in launch_ctx.host_scratch_init:
-      init_callback(scratch_alloc_op.result)
 
 def _declare_runtime_functions():
   """Declares the runtime functions that can be used by the generated code."""
@@ -603,22 +645,30 @@ def as_gpu_kernel(
   elif not isinstance(in_shape, tuple):
     in_shape = (in_shape,)
 
-  module, out_shape, unwrap_output_tuple, launch_ctx, scratch_arr = (
+  module, out_shape, unwrap_output_tuple, launch_ctx = (
       _lower_as_gpu_kernel(
           body, grid, cluster, block, in_shape, out_shape, smem_scratch_shape,
-          module_name, kernel_name, prof_spec
+          thread_semantics, module_name, kernel_name, prof_spec
       )
   )
 
   if thread_semantics == LoweringSemantics.Warpgroup and dialect is not None:
+    # We need to run a pass that removes dead-code for which layout inference
+    # does not work.
+    pm = mlir.passmanager.PassManager.parse("builtin.module(canonicalize)", module.context)
+    pm.run(module.operation)
+
     # Run Python lowering passes. The remaining passes will be run in C++ in
     # jax/jaxlib/mosaic/gpu/custom_call.cc
     layout_inference.infer_layout(module)  # pytype: disable=attribute-error
     transform_inference.infer_transforms(module)  # pytype: disable=attribute-error
     dialect_lowering.lower_mgpu_dialect(module, launch_ctx)  # pytype: disable=attribute-error
 
-  _initialize_scratch(launch_ctx, scratch_arr)
+  launch_ctx.scratch.finalize_size()
   module.operation.verify()
+
+  if launch_ctx.is_device_collective and not supports_cross_device_collectives():
+    raise RuntimeError("Kernel is a cross-device collective but no support is available.")
 
   expected_arg_treedef = jax.tree.structure(in_shape)
   def _check_args(*args):
@@ -639,7 +689,7 @@ def as_gpu_kernel(
       *results, prof_buffer = bind(*args)
       def dump_profile(prof_buffer):
         out_file = os.path.join(
-            os.getenv("TEST_UNDECLARED_OUTPUTS_DIR"),
+            os.getenv("TEST_UNDECLARED_OUTPUTS_DIR", "/tmp"),
             f"{time.time_ns()}-trace.json",
         )
         try:
@@ -686,22 +736,30 @@ def as_torch_gpu_kernel(
   flat_out_types, out_treedef = jax.tree.flatten(out_shape)
   expected_arg_treedef = jax.tree.structure(in_shape)
 
-  module, out_shape, unwrap_output_tuple, launch_ctx, scratch_arr = (
+  module, out_shape, unwrap_output_tuple, launch_ctx = (
       _lower_as_gpu_kernel(
           body, grid, cluster, block, in_shape, out_shape, smem_scratch_shape,
-          module_name, kernel_name, prof_spec
+          lowering_semantics, module_name, kernel_name, prof_spec
       )
   )
 
   if lowering_semantics == LoweringSemantics.Warpgroup and dialect is not None:
+    # We need to run a pass that removes dead-code for which layout inference
+    # does not work.
+    pm = mlir.passmanager.PassManager.parse("builtin.module(canonicalize)", module.context)
+    pm.run(module.operation)
+
     # Run Python lowering passes. The remaining passes will be run in C++ in
     # jax/jaxlib/mosaic/gpu/custom_call.cc
     layout_inference.infer_layout(module)  # pytype: disable=attribute-error
     transform_inference.infer_transforms(module)  # pytype: disable=attribute-error
     dialect_lowering.lower_mgpu_dialect(module, launch_ctx)  # pytype: disable=attribute-error
 
-  _initialize_scratch(launch_ctx, scratch_arr)
+  launch_ctx.scratch.finalize_size()
   module.operation.verify()
+
+  if launch_ctx.is_device_collective:
+    raise RuntimeError("Kernel is a cross-device collective but no support is available.")
 
   # Get our hands on the compilation and unload functions
   try:

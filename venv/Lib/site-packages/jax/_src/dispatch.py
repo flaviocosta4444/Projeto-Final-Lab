@@ -44,15 +44,14 @@ from jax._src.interpreters import mlir
 from jax._src.interpreters import pxla
 from jax._src.interpreters import xla
 from jax._src.layout import DeviceLocalLayout, Layout
-from jax._src.lib import jaxlib_extension_version
 from jax._src.lib import xla_client as xc
 from jax._src.mesh import AbstractMesh, Mesh
-from jax._src.monitoring import record_event_duration_secs, record_event_time_span
+from jax._src.monitoring import record_scalar, record_event_duration_secs, record_event_time_span
 from jax._src.partition_spec import PartitionSpec
 from jax._src.sharding import Sharding
 from jax._src.sharding_impls import (
     NamedSharding, SingleDeviceSharding, TransferToMemoryKind, GSPMDSharding,
-    PositionalSharding, is_single_device_sharding)
+    is_single_device_sharding)
 import numpy as np
 
 
@@ -133,7 +132,8 @@ class RuntimeTokenSet(threading.local):
       # TODO(yueshengys): This might still be buggy in a multi-process SPMD
       # scenario. Revise the logic later. A distributed shutdown barrier inside
       # the XLA program may be needed.
-      return jax.device_put(tok, PositionalSharding(devices))
+      return jax.device_put(
+          tok, NamedSharding(Mesh(devices, 'x'), PartitionSpec('x')))
 
     # We only use replicated sharding for the first time when the token for the
     # order effect hasn't been created.
@@ -179,6 +179,10 @@ class LogElapsedTimeContextManager:
 
   def __enter__(self):
     self.start_time = time.time()
+    if self.event is not None:
+      record_scalar(
+          self.event, self.start_time, fun_name=self.fun_name
+      )
 
   def __exit__(self, exc_type, exc_value, traceback):
     if _on_exit:
@@ -191,8 +195,12 @@ class LogElapsedTimeContextManager:
       logger.log(log_priority, self.fmt.format(
           fun_name=self.fun_name, elapsed_time=elapsed_time))
     if self.event is not None:
-      record_event_duration_secs(self.event, elapsed_time)
-      record_event_time_span(self.event, self.start_time, end_time)
+      record_event_duration_secs(
+          self.event, elapsed_time, fun_name=self.fun_name
+      )
+      record_event_time_span(
+          self.event, self.start_time, end_time, fun_name=self.fun_name
+      )
 
 log_elapsed_time = LogElapsedTimeContextManager
 
@@ -241,7 +249,7 @@ class SourceInfo(NamedTuple):
 def get_intermediate_shardings(
     jaxpr: core.Jaxpr) -> Sequence[tuple[Sharding, SourceInfo]]:
   from jax._src import pjit
-  from jax.experimental import shard_map
+  from jax._src import shard_map
 
   out = []
   for eqn in jaxpr.eqns:
@@ -256,14 +264,12 @@ def get_intermediate_shardings(
       out.extend((i, source_info) for i in eqn.params['in_shardings'])
       out.extend((o, source_info) for o in eqn.params['out_shardings'])
     elif eqn.primitive is shard_map.shard_map_p:
-      if isinstance(eqn.params['mesh'], AbstractMesh):
+      mesh = eqn.params['mesh']
+      if isinstance(mesh, AbstractMesh):
         continue
       source_info = SourceInfo(eqn.source_info, eqn.primitive.name)
-      def _names_to_pspec(names):
-        ndmin = max(names) + 1 if names else 0
-        return PartitionSpec(*(names.get(i) for i in range(ndmin)))
-      out.extend((NamedSharding(eqn.params['mesh'], _names_to_pspec(names)), source_info)
-                 for names in [*eqn.params['in_names'], *eqn.params['out_names']])
+      out.extend((NamedSharding(mesh, spec), source_info)
+                 for spec in [*eqn.params['in_specs'], *eqn.params['out_specs']])
     elif eqn.primitive is device_put_p:
       source_info = SourceInfo(eqn.source_info, eqn.primitive.name)
       out.extend((s, source_info) for s in eqn.params['devices']
@@ -466,10 +472,16 @@ def _device_put_sharding_impl(x, aval, device, copy):
 
     if not s.is_fully_addressable:
       if ((isinstance(x, array.ArrayImpl) and not x._committed) or
-          type(x) in array_types):
-        # TODO(emilyaf): Remove this condition when jit works when a sharding
-        # has no local devices.
-        if not config.enable_empty_arrays.value:
+          type(x) in array_types or type(x) in dtypes.python_scalar_dtypes):
+        # If all hosts participate in the sharding, assert that the input is the
+        # same on all hosts. If some hosts have no addressable devices in the
+        # sharding, bypass the check, since we can't easily distinguish between
+        # these two cases: (1) the sharding contains the same subset of global
+        # devices on all hosts (and hosts with no addressable devices in the
+        # sharding do not transfer data) or (2) the sharding contains a
+        # different subset of devices on each host. For (1), the input should be
+        # the same on all hosts, but for (2) it need not be.
+        if jax.process_count() == len(s._internal_device_list.process_indices):  # pytype: disable=attribute-error
           multihost_utils.assert_equal(
               x, fail_message=(
                   f"{type(x)} passed to device_put is not the same on each"
@@ -496,7 +508,7 @@ def _device_put_sharding_impl(x, aval, device, copy):
         return _DeferredShardArg(x, x.sharding, aval, x.committed, copy)
     elif is_single_device_sharding(x.sharding):
       device = x.sharding._device_assignment[0] if device is None else device
-      if copy == CopySemantics.COPY and jaxlib_extension_version >= 327:
+      if copy == CopySemantics.COPY:
         return xc.batched_device_put(aval, SingleDeviceSharding(device), [x],
                                      [device], True, True)
       return pxla.batched_device_put(aval, SingleDeviceSharding(device), [x],

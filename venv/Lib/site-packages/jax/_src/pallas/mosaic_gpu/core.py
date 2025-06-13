@@ -22,16 +22,18 @@ from collections.abc import Callable, Iterable, Sequence
 import dataclasses
 import enum
 import itertools as it
-from typing import Any, ClassVar, Literal
+import math
+from typing import Any, ClassVar, Literal, Union
 
 import jax
 from jax._src import core as jax_core
 from jax._src import dtypes
 from jax._src import effects
-from jax._src import tree_util
 from jax._src import pretty_printer as pp
+from jax._src import tree_util
 from jax._src.lib.mlir.dialects import arith as arith_dialect
 from jax._src.pallas import core as pallas_core
+from jax._src.pallas import helpers as pallas_helpers
 from jax._src.pallas import primitives as pallas_primitives
 import jax._src.pallas.utils as pallas_utils
 from jax._src.state import discharge as state_discharge
@@ -43,9 +45,15 @@ import jax.numpy as jnp
 from jaxlib.mlir import ir
 
 
+_Ref = pallas_core.AbstractMemoryRef | state_types.TransformedRef
 AbstractMemoryRef = pallas_core.AbstractMemoryRef
 
 DimensionSemantics = Literal["parallel", "sequential"]
+
+# We align all our SMEM allocations to 1024 bytes. TMA and WGMMA are very
+# sensitive to alignment and while this is quite conservative, it gets the job
+# done. We should make this more refined in the future.
+SMEM_ALIGNMENT = 1024
 
 
 def is_trivial_index(idx, shape) -> bool:
@@ -63,7 +71,7 @@ def is_trivial_index(idx, shape) -> bool:
 
 
 @dataclasses.dataclass(frozen=True, kw_only=True)
-class GPUCompilerParams(pallas_core.CompilerParams):
+class CompilerParams(pallas_core.CompilerParams):
   """Mosaic GPU compiler parameters.
 
   Attributes:
@@ -84,7 +92,7 @@ class GPUCompilerParams(pallas_core.CompilerParams):
       events than this.
     profile_dir: The directory to which profiling traces will be written to.
   """
-  PLATFORM: ClassVar[str] = "mosaic_gpu"
+  BACKEND: ClassVar[pallas_core.Backend] = "mosaic_gpu"
   approx_math: bool = False
   dimension_semantics: Sequence[DimensionSemantics] | None = None
   max_concurrent_steps: int = 1
@@ -100,7 +108,7 @@ class GPUCompilerParams(pallas_core.CompilerParams):
       )
 
 
-class GPUMemorySpace(enum.Enum):
+class MemorySpace(enum.Enum):
   #: Global memory.
   GMEM = "gmem"
   #: Shared memory.
@@ -117,10 +125,14 @@ class GPUMemorySpace(enum.Enum):
       self,
       shape: tuple[int, ...],
       dtype: jnp.dtype,
+      *,
       transforms: Sequence[MemoryRefTransform] = (),
+      packed: bool | None = None,
+      collective: bool | None = None
   ) -> pallas_core.MemoryRef:
     # A convenience function for constructing MemoryRef types.
-    return GPUMemoryRef(shape, dtype, memory_space=self, transforms=transforms)
+    return GPUMemoryRef(shape, dtype, memory_space=self, transforms=transforms,
+                        packed=packed, collective=collective)
 
 
 class SemaphoreType(enum.Enum):
@@ -133,12 +145,12 @@ class SemaphoreType(enum.Enum):
       dtype = pallas_core.BarrierSemaphore()
     else:
       dtype = pallas_core.Semaphore()
-    return pallas_core.MemoryRef(shape, dtype, GPUMemorySpace.GMEM)
+    return pallas_core.MemoryRef(shape, dtype, MemorySpace.GMEM)
 
   def get_array_aval(self) -> jax_core.ShapedArray:
     return self(()).get_array_aval()
 
-  def get_ref_aval(self) -> pallas_core.TransformedRef | AbstractMemoryRef:
+  def get_ref_aval(self) -> _Ref:
     return self(()).get_ref_aval()
 
 
@@ -162,8 +174,8 @@ def kernel(
     body: Callable[..., None],
     out_shape: object,
     *,
-    scratch_shapes: Sequence[pallas_core.ScratchShape] = (),
-    compiler_params: object | None = None,
+    scratch_shapes: pallas_core.ScratchShapeTree = (),
+    compiler_params: pallas_core.CompilerParams | None = None,
     **mesh_kwargs: object,
 ):
   if unwrap_out := not isinstance(out_shape, (tuple, list)):
@@ -171,16 +183,19 @@ def kernel(
   def wrapper(*operands):
     def stateful(operand_and_out_refs):
       operand_refs, out_refs = operand_and_out_refs
+      mesh = Mesh(**mesh_kwargs)
+      thread_name = mesh.thread_name if mesh.thread_name is not None else ()
       def cmap_body():
         pallas_primitives.run_scoped(
             lambda *scratch_refs: body(*operand_refs, *out_refs, *scratch_refs),
             *scratch_shapes,
+            collective_axes=thread_name,
         )
       pallas_core.core_map(
-          GPUMesh(**mesh_kwargs), compiler_params=compiler_params
+          mesh, compiler_params=compiler_params
       )(cmap_body)
     _, outs = state_discharge.run_state(stateful)(
-        (operands, jax.tree.map(jnp.zeros_like, out_shape))
+        (operands, pallas_helpers.empty_like(out_shape, backend="mosaic_gpu"))
     )
     return outs[0] if unwrap_out else outs
   return wrapper
@@ -188,6 +203,8 @@ def kernel(
 
 def _is_known_divisible(value, divisor, fuel=10) -> bool:
   """Returns True if the value is statically known to be divisible by the divisor."""
+  if divisor == 1:
+    return True
   if fuel < 0:
     return False
   if not isinstance(value.owner, ir.Operation):
@@ -201,6 +218,10 @@ def _is_known_divisible(value, divisor, fuel=10) -> bool:
     case arith_dialect.MulIOp():
       return (_is_known_divisible(value.owner.operands[0], divisor, fuel // 2) or
               _is_known_divisible(value.owner.operands[1], divisor, (fuel + 1)// 2))
+    case arith_dialect.SelectOp():
+      return (_is_known_divisible(value.owner.operands[1], divisor, fuel // 2) and
+              _is_known_divisible(value.owner.operands[2], divisor, (fuel + 1)// 2))
+
   return False
 
 
@@ -208,18 +229,159 @@ def _is_known_divisible(value, divisor, fuel=10) -> bool:
 class GPUMemoryRef(pallas_core.MemoryRef):
   transforms: Sequence[MemoryRefTransform] = ()
 
-  def get_ref_aval(self) -> pallas_core.TransformedRef | AbstractMemoryRef:
+  # Whether to allow TMEM packing for sub 4-byte dtypes.
+  packed: bool | None = dataclasses.field(default=None, kw_only=True)
+  collective: bool | None = dataclasses.field(default=None, kw_only=True)
+
+  def __post_init__(self):
+    if self.memory_space != MemorySpace.TMEM:
+      if self.packed is not None:
+        raise ValueError("Packed option is only supported for TMEM.")
+      if self.collective is not None:
+        raise ValueError("Collective option is only supported for TMEM.")
+
+  def get_ref_aval(self) -> _Ref:
     aval = jax_core.ShapedArray(self.shape, self.dtype)
     for t in self.transforms:
       aval = t(aval)
-    ref = pallas_core.TransformedRef(
-        AbstractMemoryRef(aval, memory_space=self.memory_space), ()
-    )
+    if self.memory_space == MemorySpace.TMEM:
+      ref = pallas_core.TransformedRef(
+          AbstractTMEMRef(aval,
+                          memory_space=self.memory_space,
+                          packed=self.packed,
+                          collective=self.collective), ()
+      )
+    else:
+      ref = pallas_core.TransformedRef(
+          AbstractMemoryRef(aval, memory_space=self.memory_space), ()
+      )
     for t in reversed(self.transforms):
       ref = t.undo(ref)
     if not ref.transforms:
       return ref.ref
     return ref
+
+
+def align_to(x: int, alignment: int):
+  if rem := x % alignment:
+    return x + alignment - rem
+  return x
+
+
+# A tree of `GPUMemoryRef`s.
+_GPUMemoryRefTree = Any
+
+
+def _ref_group_size(refs: _GPUMemoryRefTree) -> int:
+  if isinstance(refs, GPUMemoryRef):
+    refs = (refs,)
+  size = 0
+  for ref in jax.tree.leaves(refs):
+    # Make sure that the start of each ref is aligned with `SMEM_ALIGNMENT`.
+    size = align_to(size, SMEM_ALIGNMENT)
+    if jnp.issubdtype(ref.dtype, jnp.integer):
+      nbits = jnp.iinfo(ref.dtype).bits
+    elif jnp.issubdtype(ref.dtype, jnp.floating):
+      nbits = jnp.finfo(ref.dtype).bits
+    else:
+      raise NotImplementedError(f"Unsupported dtype: {ref.dtype}")
+    ref_bits = math.prod(ref.shape) * nbits
+    if ref_bits % 8:
+      raise ValueError("Only byte-aligned shapes are supported.")
+    size += ref_bits // 8
+  return size
+
+
+def flatten_ref_union(ref_union: AbstractRefUnion) -> tuple[_Ref, ...]:
+  """Flattens a union of trees of references into a tuple of references.
+
+  This is the moral equivalent of `jax.tree.leaves` for aliased references.
+  """
+  flat_refs = []
+  union_bytes = 0
+  for ref_group in ref_union.refs:
+    byte_offset = 0
+    for ref in jax.tree.leaves(ref_group):
+      byte_offset = align_to(byte_offset, SMEM_ALIGNMENT)
+      assert isinstance(ref, pallas_core.AbstractMemoryRef) or isinstance(
+          ref, pallas_core.TransformedRef
+      )
+      if not isinstance(ref, pallas_core.TransformedRef):
+        ref = pallas_core.TransformedRef(ref, transforms=())
+      transform = ExtractAliasedRef.from_transformed_ref(ref, byte_offset)
+      flat_refs.append(
+          pallas_core.TransformedRef(
+              ref_union, transforms=(transform, *ref.transforms)
+          )
+      )
+      if jnp.issubdtype(ref.dtype, jnp.integer):
+        nbits = jnp.iinfo(ref.dtype).bits
+      elif jnp.issubdtype(ref.dtype, jnp.floating):
+        nbits = jnp.finfo(ref.dtype).bits
+      else:
+        raise NotImplementedError(f"Unsupported dtype: {ref.dtype}")
+      ref_bits = math.prod(ref.shape) * nbits
+      if ref_bits % 8:
+        raise ValueError("Only byte-aligned shapes are supported.")
+      byte_offset += ref_bits // 8
+    union_bytes = max(union_bytes, byte_offset)
+  assert union_bytes == ref_union.shape[0]
+  return tuple(flat_refs)
+
+
+class AbstractRefUnion(pallas_core.AbstractMemoryRef):
+  refs: Sequence[_GPUMemoryRefTree]
+
+  def __init__(
+      self,
+      aval,
+      refs: Sequence[_GPUMemoryRefTree],
+      memory_space,
+  ):
+    self.refs = refs
+    super().__init__(aval, memory_space=memory_space)
+
+  def _iter(self, tracer):
+    return iter(flatten_ref_union(tracer))
+
+  def _getitem(self, tracer, index):
+    return list(iter(tracer))[index]
+
+  def _setitem(self, tracer, index, value):
+    del tracer, index, value  # Unused.
+    raise ValueError("Ref unions can't be assigned to.")
+
+
+@dataclasses.dataclass(init=False, frozen=True)
+class RefUnion(GPUMemoryRef):
+  """A sequence of trees of refs that are allowed to reuse the same memory.
+
+  One should not make assumptions as to how each ref will map to the underlying
+  memory region, since arbitrary padding may be applied inbetween different
+  refs.
+
+  As such, ref unions are only safe to use when the groups of refs that we
+  intend to alias have disjoint lifetimes (i.e. one should never attempt to read
+  data using a different ref than the one that was used to write the data).
+  """
+  refs: Sequence[_GPUMemoryRefTree] = ()
+
+  def __init__(self, *refs: _GPUMemoryRefTree):
+    if any(ref.memory_space != SMEM for ref in jax.tree.leaves(refs)):
+      raise NotImplementedError("Only SMEM refs can be aliased.")
+    object.__setattr__(self, "refs", refs)
+    num_bytes = max(map(_ref_group_size, self.refs))
+    super().__init__(
+        shape=(num_bytes,),
+        dtype=jnp.int8,
+        memory_space=SMEM,
+        transforms=(),
+    )
+
+  def get_ref_aval(self) -> AbstractRefUnion:
+    inner_aval = jax.core.ShapedArray(self.shape, self.dtype)
+    refs_aval = jax.tree.map(lambda ref: ref.get_ref_aval(), self.refs)
+    return AbstractRefUnion(inner_aval, refs_aval, memory_space=SMEM)
 
 
 class MemoryRefTransform(pallas_core.MemoryRefTransform, abc.ABC):
@@ -240,7 +402,7 @@ class MemoryRefTransform(pallas_core.MemoryRefTransform, abc.ABC):
         shape=self.to_gpu_transform().transform_shape(aval.shape)
     )
 
-Index = mgpu.DynamicSlice | slice | int | ir.Value
+Index = Union[mgpu.DynamicSlice, slice, int, ir.Value]
 
 @dataclasses.dataclass(frozen=True)
 class TilingTransform(MemoryRefTransform):
@@ -433,12 +595,52 @@ class TransposeRef(state_types.Transform):
     return pp.text(f"{{transpose({list(self.permutation)})}}")
 
 
+@tree_util.register_pytree_node_class
+@dataclasses.dataclass
+class PeerMemRef(state_types.Transform):
+  device_id: Any
+  device_id_type: pallas_primitives.DeviceIdType
+
+  def transform_shape(self, shape):
+    return shape
+
+  def transform_dtype(self, dtype):
+    return dtype
+
+  def untransform_index(
+      self, idxs: tuple[Index, ...]
+  ) -> tuple[tuple[Index, ...], state_types.Transform]:
+    return idxs, self
+
+  def tree_flatten(self):
+    return (self.device_id,), (self.device_id_type,)
+
+  @classmethod
+  def tree_unflatten(cls, metadata, arrays):
+    return cls(arrays[0], metadata[0])
+
+
+def remote_ref(
+    ref: _Ref,
+    device_id: jax.typing.ArrayLike,
+    device_id_type: pallas_primitives.DeviceIdType = pallas_primitives.DeviceIdType.MESH,
+) -> pallas_core.TransformedRef:
+  """Translate memref to a symmetric memref on a peer device."""
+  if not isinstance(ref, pallas_core.TransformedRef):
+    if not isinstance(jax_core.get_aval(ref), state_types.AbstractRef):
+      raise TypeError("ref must be a reference")
+    ref = pallas_core.TransformedRef(ref, transforms=())
+  return pallas_core.TransformedRef(
+      ref.ref, (*ref.transforms, PeerMemRef(device_id, device_id_type)),
+  )
+
+
 def transform_ref(
     ref: pallas_core.TransformedRef,
     transform: state_types.Transform
 ) -> pallas_core.TransformedRef:
   if not isinstance(ref, pallas_core.TransformedRef):
-    if not isinstance(jax_core.get_aval(ref), pallas_core.AbstractMemoryRef):
+    if not isinstance(jax_core.get_aval(ref), state_types.AbstractRef):
       raise TypeError("ref must be a reference")
     ref = pallas_core.TransformedRef(ref, transforms=())
   return pallas_core.TransformedRef(
@@ -456,6 +658,40 @@ def untile_ref(ref, tiling: tuple[int, ...]) -> pallas_core.TransformedRef:
 
 def unswizzle_ref(ref, swizzle: int) -> pallas_core.TransformedRef:
   return transform_ref(ref, UnswizzleRef(swizzle))
+
+
+@tree_util.register_pytree_node_class
+@dataclasses.dataclass(frozen=True)
+class ExtractAliasedRef(state_types.Transform):
+  """Bitcasts the underlying ref at the given offset to the given shape and dtype."""
+  dtype: dtypes.DType
+  shape: tuple[int, ...]
+  offset: int
+
+  @classmethod
+  def from_transformed_ref(
+      cls, ref: pallas_core.TransformedRef, byte_offset: int
+  ):
+    return cls(
+        dtypes.dtype(ref.dtype), ref.ref.shape, byte_offset
+    )
+
+  def transform_shape(self, shape):
+    if shape is None:
+      return None
+    return self.shape
+
+  def transform_dtype(self, dtype):
+    del dtype  # Unused.
+    return self.dtype
+
+  def tree_flatten(self):
+    return (), (self.dtype, self.shape, self.offset)
+
+  @classmethod
+  def tree_unflatten(cls, metadata, arrays):
+    assert not arrays
+    return cls(*metadata)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -549,7 +785,7 @@ class UnswizzleRef(state_types.Transform):
 
 
 @dataclasses.dataclass
-class GPUBlockSpec(pallas_core.BlockSpec):
+class BlockSpec(pallas_core.BlockSpec):
   transforms: Sequence[MemoryRefTransform] = ()
 
   def to_block_mapping(
@@ -581,10 +817,10 @@ class GPUBlockSpec(pallas_core.BlockSpec):
     )
 
 
-GMEM = GPUMemorySpace.GMEM
-SMEM = GPUMemorySpace.SMEM
-TMEM = GPUMemorySpace.TMEM
-REGS = GPUMemorySpace.REGS
+GMEM = MemorySpace.GMEM
+SMEM = MemorySpace.SMEM
+TMEM = MemorySpace.TMEM
+REGS = MemorySpace.REGS
 
 
 class barrier_dtype(dtypes.extended):
@@ -597,6 +833,7 @@ class BarrierType(dtypes.ExtendedDType):
   name: ClassVar[str] = "barrier"
 
   num_arrivals: int
+  for_tensor_core: bool
 
   def __str__(self):
     return self.name
@@ -615,15 +852,32 @@ class ClusterBarrierType(dtypes.ExtendedDType):
 
 @dataclasses.dataclass(frozen=True)
 class Barrier:
+  """Describes a barrier Ref.
+
+  Attributes:
+    num_arrivals: The number of arrivals that will be recorded by this barrier.
+    num_barriers: The number of barriers that will be created. Individual
+      barriers can be accessed by indexing into the barrier Ref.
+    for_tensor_core: Whether this barrier is used for synchronizing with
+      the tensor core. This should be set to True when waiting on Blackwell
+      (TC Gen 5) asynchoronous matmul instructions.
+  """
   num_arrivals: int
   num_barriers: int = 1
+  for_tensor_core: bool = dataclasses.field(default=False, kw_only=True)
 
   def get_ref_aval(self) -> AbstractMemoryRef:
     aval = jax_core.ShapedArray(
-        [self.num_barriers], BarrierType(self.num_arrivals)
+        [self.num_barriers], BarrierType(self.num_arrivals,
+                                         for_tensor_core=self.for_tensor_core)
     )
     return AbstractMemoryRef(aval, SMEM)
 
+  def __post_init__(self):
+    if self.num_arrivals < 1:
+      raise ValueError(
+          f"Num arrivals must be at least 1, but got {self.num_arrivals}"
+      )
 
 @dataclasses.dataclass(frozen=True)
 class ClusterBarrier:
@@ -649,7 +903,7 @@ class WGMMAAccumulatorRef:
           "Preinitialized WGMMAAccumulatorRef only supported in pl.run_state."
       )
     return WGMMAAbstractAccumulatorRef(
-        jax_core.ShapedArray(shape=self.shape, dtype=self.dtype), GPUMemorySpace.REGS
+        jax_core.ShapedArray(shape=self.shape, dtype=self.dtype), MemorySpace.REGS
     )
 
   @staticmethod
@@ -659,7 +913,7 @@ class WGMMAAccumulatorRef:
 
 def _wgmma_ref_type_mapping(ref: WGMMAAccumulatorRef):
   aval = WGMMAAbstractAccumulatorRef(
-      jax_core.ShapedArray(shape=ref.shape, dtype=ref.dtype), GPUMemorySpace.REGS
+      jax_core.ShapedArray(shape=ref.shape, dtype=ref.dtype), MemorySpace.REGS
   )
   return aval, ref._init
 state_types._ref_type_aval_mappings[WGMMAAccumulatorRef] = _wgmma_ref_type_mapping
@@ -693,11 +947,22 @@ def _as_accum(ref) -> WGMMAAbstractAccumulatorRef:
       memory_space=ref.memory_space,  # pytype: disable=attribute-error
   )
 
+class AbstractTMEMRef(AbstractMemoryRef):
+  __slots__ = ["inner_aval", "memory_space", "packed", "collective"]
+
+  def __init__(self, inner_aval, memory_space, packed, collective):
+    super().__init__(inner_aval, memory_space)
+    self.packed = packed
+    self.collective = collective
+
+  def __repr__(self) -> str:
+    return f'TMEM({self.inner_aval.str_short()},packed={self.packed})'
+
 
 _WARPGROUP_AXIS_NAME = object()
 
 @dataclasses.dataclass(frozen=True, kw_only=True)
-class GPUMesh:
+class Mesh:
   grid: Sequence[int] = ()
   grid_names: Sequence[str] = ()
   cluster: Sequence[int] = ()
@@ -784,15 +1049,15 @@ def _gpu_mesh_discharge_rule(
     cost_estimate,
     name,
 ):
-  if not isinstance(mesh, GPUMesh):
-    raise TypeError(f"Mesh must be a GPUMesh, got {type(mesh)}")
-  if compiler_params and not isinstance(compiler_params, GPUCompilerParams):
+  if not isinstance(mesh, Mesh):
+    raise TypeError(f"Mesh must be a `plgpu.Mesh`, got {type(mesh)}")
+  if compiler_params and not isinstance(compiler_params, CompilerParams):
     raise TypeError(
-        "Compiler params must be a GPUCompilerParams, got"
+        "Compiler params must be a `plgpu.CompilerParams`, got"
         f" {type(compiler_params)}"
     )
   if not compiler_params:
-    compiler_params = GPUCompilerParams()
+    compiler_params = CompilerParams()
   return pallas_core.default_mesh_discharge_rule(
       in_avals,
       out_avals,
@@ -808,7 +1073,7 @@ def _gpu_mesh_discharge_rule(
   )
 
 
-pallas_core._core_map_mesh_rules[GPUMesh] = _gpu_mesh_discharge_rule
+pallas_core._core_map_mesh_rules[Mesh] = _gpu_mesh_discharge_rule
 
 
 class MemoryEffect(jax_core.Effect):

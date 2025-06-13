@@ -38,8 +38,7 @@ from jax._src.interpreters import pxla
 from jax._src.interpreters import xla
 from jax._src.layout import AutoLayout, DeviceLocalLayout, Layout
 from jax._src.lib import xla_client as xc
-from jax._src.lib import xla_extension as xe
-from jax._src.lib import jaxlib_extension_version
+from jax._src.lib import _jax
 from jax._src.sharding import Sharding
 from jax._src.sharding_impls import (
     PmapSharding, SingleDeviceSharding,
@@ -555,7 +554,7 @@ class ArrayImpl(basearray.Array):
     try:
       return Layout(DeviceLocalLayout.from_pjrt_layout(self._pjrt_layout),
                     self.sharding)
-    except xe.XlaRuntimeError as e:
+    except _jax.XlaRuntimeError as e:
       msg, *_ = e.args
       if type(msg) is str and msg.startswith("UNIMPLEMENTED"):
         return Layout(None, self.sharding)
@@ -637,7 +636,8 @@ class ArrayImpl(basearray.Array):
     self._check_if_deleted()
 
     if self._npy_value is None:
-      if self.is_fully_replicated:
+      if (self.is_fully_replicated and
+          self.sharding._internal_device_list.addressable_device_list):  # type: ignore
         npy_value, did_copy = self._single_device_array_to_np_array_did_copy()
         npy_value.flags.writeable = False
         if did_copy:
@@ -1094,8 +1094,6 @@ def _get_aval_array(self):
   return core.update_aval_with_sharding(self.aval, self.sharding)
 core.pytype_aval_mappings[ArrayImpl] = _get_aval_array
 
-if jaxlib_extension_version < 325:
-  basearray.Array.register(ArrayImpl)
 
 def _array_mlir_constant_handler(val):
   try:

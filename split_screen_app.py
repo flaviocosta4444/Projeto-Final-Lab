@@ -146,52 +146,16 @@ def run_split_screen(exercicio, plano_treino=None):
     }
 
     def update_feedback_system(frame_feedbacks, landmarks):
-        current_time = time.time()
+        if not landmarks:
+            return "Posicao nao detectada claramente. Ajuste sua posicao."
         
-        # Verificar confiança da detecção apenas para landmarks críticas do lado visível
-        if landmarks:
-            visible_side = get_visible_side(landmarks) # Determine o lado visível
-            critical_visibility = []
-
-            for lm_idx_enum in CRITICAL_LANDMARKS:
-                lm_idx = lm_idx_enum.value
-                # Se o lado não for 'both', ignore landmarks do lado oculto
-                if visible_side == "left" and "RIGHT" in lm_idx_enum.name:
-                    continue
-                if visible_side == "right" and "LEFT" in lm_idx_enum.name:
-                    continue
-
-                if lm_idx < len(landmarks.landmark):
-                    critical_visibility.append(landmarks.landmark[lm_idx].visibility)
-            
-            if critical_visibility:
-                # Usar a média das visibilidades das landmarks críticas visíveis
-                confidence = sum(critical_visibility) / len(critical_visibility)
-            else:
-                confidence = 0.0 # Sem landmarks críticas detectadas no lado visível
-
-            if confidence < feedback_system['min_confidence']:
-                return clean_text_for_display("Posicao nao detectada claramente. Ajuste sua posicao.")
-        
-        # Atualizar histórico de feedback
-        if frame_feedbacks:
-            feedback_system['feedback_history'].append(frame_feedbacks[0])
-            # Manter apenas os últimos 30 feedbacks
-            feedback_system['feedback_history'] = feedback_system['feedback_history'][-30:]
-        
-        # Verificar se passou tempo suficiente desde o último feedback
-        if current_time - feedback_system['last_feedback_time'] < feedback_system['feedback_cooldown']:
+        if not frame_feedbacks:
             return None
         
-        # Contar ocorrências do feedback mais recente
-        if feedback_system['feedback_history']:
-            recent_feedback = feedback_system['feedback_history'][-1]
-            count = feedback_system['feedback_history'].count(recent_feedback)
-            
-            # Se o feedback se repetiu várias vezes, exibi-lo
-            if count >= feedback_system['feedback_threshold']:
-                feedback_system['last_feedback_time'] = current_time
-                return recent_feedback
+        # Retornar o primeiro feedback não vazio
+        for feedback in frame_feedbacks:
+            if feedback and feedback.strip():
+                return feedback
         
         return None
 
@@ -203,7 +167,8 @@ def run_split_screen(exercicio, plano_treino=None):
         font = cv2.FONT_HERSHEY_SIMPLEX
         font_scale = 0.7
         thickness = 2
-        padding = 10
+        padding = 15
+        line_spacing = 10
         
         # Calcular tamanho do texto
         (text_width, text_height), _ = cv2.getTextSize(feedback, font, font_scale, thickness)
@@ -213,23 +178,82 @@ def run_split_screen(exercicio, plano_treino=None):
         box_width = text_width + 2 * padding
         box_height = text_height + 2 * padding
         
-        # Desenhar caixa com cantos arredondados
+        # Desenhar caixa com cantos arredondados e sombra
+        # Primeiro desenhar a sombra
+        shadow_offset = 3
+        draw_rounded_box(frame, 
+                        (x + shadow_offset, y - box_height + shadow_offset), 
+                        (x + box_width + shadow_offset, y + shadow_offset), 
+                        (0, 0, 0), 
+                        radius=20, 
+                        alpha=0.3)
+        
+        # Depois desenhar a caixa principal
         draw_rounded_box(frame, 
                         (x, y - box_height), 
                         (x + box_width, y), 
                         color, 
                         radius=20, 
-                        alpha=0.8)
+                        alpha=0.9)
         
-        # Desenhar texto
+        # Desenhar texto com borda para melhor legibilidade
+        text_x = x + padding
+        text_y = y - padding
+        
+        # Desenhar borda do texto
+        for offset_x, offset_y in [(-1,-1), (-1,1), (1,-1), (1,1)]:
+            cv2.putText(frame, 
+                       feedback, 
+                       (text_x + offset_x, text_y + offset_y), 
+                       font, 
+                       font_scale, 
+                       (0, 0, 0), 
+                       thickness + 1, 
+                       cv2.LINE_AA)
+        
+        # Desenhar texto principal
         cv2.putText(frame, 
                    feedback, 
-                   (x + padding, y - padding), 
+                   (text_x, text_y), 
                    font, 
                    font_scale, 
                    (255, 255, 255), 
                    thickness, 
                    cv2.LINE_AA)
+
+    def draw_feedback_stack(frame, feedbacks, start_position, color):
+        """
+        Desenha múltiplos feedbacks em uma pilha vertical com espaçamento adequado.
+        """
+        if not feedbacks:
+            return
+        
+        x, y = start_position
+        spacing = 10  # Espaçamento entre caixas de feedback
+        
+        for feedback in feedbacks:
+            draw_feedback_box(frame, feedback, (x, y), color)
+            # Atualizar y para a próxima caixa
+            y -= 60  # Altura da caixa + espaçamento
+
+    def draw_exercise_info(frame, exercise_name, stage, score, position, color):
+        """
+        Desenha as informações do exercício em um painel organizado.
+        """
+        x, y = position
+        padding = 15
+        
+        # Criar lista de informações
+        info_items = [
+            f"Exercicio: {exercise_name}",
+            f"Etapa: {stage}",  # Removido o +1 para mostrar o número correto da etapa
+            f"Pontuacao: {score:.2f}"
+        ]
+        
+        # Desenhar cada item
+        for item in info_items:
+            draw_feedback_box(frame, item, (x, y), color)
+            y -= 60
 
     with mp_pose.Pose(min_detection_confidence=0.5, min_tracking_confidence=0.5) as pose:
         while cap.isOpened():
@@ -418,27 +442,27 @@ def run_split_screen(exercicio, plano_treino=None):
                 # Calcular a pontuação do frame usando a função calcular_pontuacao
                 frame_score_calculated = calcular_pontuacao(calculated_angles, reference_angles)
 
-                # Atualizar pontuação total (acumulando a pontuação calculada por frame)
-                feedback_system['score'] += frame_score_calculated
+                # Atualizar pontuação atual (sem acumular)
+                feedback_system['score'] = frame_score_calculated
 
                 # Atualizar sistema de feedback
                 current_feedback = update_feedback_system(frame_feedbacks, results.pose_landmarks)
 
-                # Desenhar feedback em tempo real
+                # Organizar feedbacks em categorias
+                feedbacks_to_show = []
                 if current_feedback:
-                    draw_feedback_box(frame,
-                                      clean_text_for_display(current_feedback),
-                                      (width - 400, 100),
-                                      TURQUOISE)
+                    feedbacks_to_show.append(current_feedback)
 
-                # Mostrar pontuação atual
-                if feedback_system['frame_count'] > 0:
-                    avg_score = feedback_system['score'] / feedback_system['frame_count']
-                    score_text = f"Pontuacao: {avg_score:.2f}"
-                    draw_feedback_box(frame,
-                                      clean_text_for_display(score_text),
-                                      (width - 200, 50),
-                                      TURQUOISE)
+                # Desenhar feedbacks organizados
+                draw_feedback_stack(frame, feedbacks_to_show, (width - 400, height - 200), TURQUOISE)
+
+                # Desenhar informações do exercício
+                draw_exercise_info(frame, 
+                                 current_exercicio_name, 
+                                 frame_idx, 
+                                 feedback_system['score'],
+                                 (width - 400, height - 50),
+                                 TURQUOISE)
 
                 feedback_system['frame_count'] += 1
 

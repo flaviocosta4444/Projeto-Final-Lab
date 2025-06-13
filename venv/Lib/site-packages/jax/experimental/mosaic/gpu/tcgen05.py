@@ -35,6 +35,29 @@ from .launch_context import LaunchContext
 
 TMEM_ROWS = 128
 TCGEN05_SMEM_DESCRIPTOR_BIT = 1 << 46
+# Like WGMMA_LAYOUT, only each warp holds a 32xN strip instead of 16xN.
+# The name is so short, because it's meant to be used qualified (tcgen05.LAYOUT)
+LAYOUT = fa.TiledLayout(
+    fa.Tiling(((128, 8), (32, 8), (8, 8), (1, 2))),
+    warp_dim=-8,
+    lane_dims=(-4, -3),
+    vector_dim=-1,
+)
+# A layout resembling the logical organization of TMEM. The 128 rows in a tile
+# are assigned to 128 lanes in the warpgroup. Useful when the result needs to be
+# processed in registers and then stored back into TMEM. Should not be used if
+# the result is to be written back to SMEM, as there is no good way to store it
+# without bank conflicts.
+#
+# We use a vector_dim of 2, to be able to make sure that the vectors are always
+# a multiple of 32-bits, even when the data is 16-bits.
+TMEM_NATIVE_LAYOUT = fa.TiledLayout(
+    fa.Tiling(((128, 2), (32, 2))),
+    warp_dim=-4,
+    lane_dims=(-2,),
+    vector_dim=-1,
+)
+
 
 def create_instr_descriptor(
     m: int,
@@ -47,17 +70,42 @@ def create_instr_descriptor(
   f32 = ir.F32Type.get()
   bf16 = ir.BF16Type.get()
   f16 = ir.F16Type.get()
-  if input_dtype not in {f16, bf16}:
-    raise NotImplementedError("Only float16 and bfloat16 inputs supported")
   if acc_dtype not in {f32, f16}:
     raise NotImplementedError("Only float32 and float16 accumulators supported")
+  if utils.bitwidth(input_dtype) == 16:
+    if input_dtype not in {f16, bf16}:
+      raise NotImplementedError(
+          "The only supported 16-bit input types are float16 and bfloat16, got"
+          f" {input_dtype}"
+      )
+    desc = 0
+    desc |= (acc_dtype == f32) << 4  # D dtype, bits 4-5
+    # Bit 6 is reserved
+    desc |= (input_dtype == bf16) << 7  # A dtype, bits 7-9
+    desc |= (input_dtype == bf16) << 10  # B dtype, bits 10-12
+    return _finish_instr_descriptor(desc, m, n, transpose_a, transpose_b)
+  elif utils.bitwidth(input_dtype) == 8:
+    desc = 0
+    desc |= (acc_dtype == f32) << 4  # D dtype, bits 4-5
+    # Bit 6 is reserved
+    if input_dtype == ir.Float8E4M3FNType.get():
+      input_dtype_enum = 0
+    elif input_dtype == ir.Float8E5M2Type.get():
+      input_dtype_enum = 1
+    else:
+      raise NotImplementedError(f"Unsupported input dtype: {input_dtype}")
+    desc |= input_dtype_enum << 7  # A dtype, bits 7-9
+    desc |= input_dtype_enum << 10  # B dtype, bits 10-12
+    return _finish_instr_descriptor(desc, m, n, transpose_a, transpose_b)
+  else:
+    raise NotImplementedError(f"Unsupported input dtype: {input_dtype}")
 
-  desc = 0
+
+def _finish_instr_descriptor(
+    desc: int, m: int, n: int, transpose_a: bool, transpose_b: bool,
+):
   # We ignore sparsity in bits 0-3
-  desc |= (acc_dtype == f32) << 4  # D dtype, bits 4-5
-  # Bit 6 is reserved
-  desc |= (input_dtype == bf16) << 7  # A dtype, bits 7-9
-  desc |= (input_dtype == bf16) << 10  # B dtype, bits 10-12
+  # A, B and D types are set by the caller
   # We ignore negate bits 13-14
   desc |= transpose_a << 15  # Transpose A
   desc |= transpose_b << 16  # Transpose B
@@ -75,7 +123,7 @@ def create_instr_descriptor(
 
 def mma(
     d: TMEMRef,
-    a: ir.Value,
+    a: ir.Value | TMEMRef,
     b: ir.Value,
     *,
     a_swizzle: int = 128,
@@ -95,12 +143,22 @@ def mma(
   num_cta = 2 if collective else 1
 
   # Step 1. Establish the shape and element type of the operation.
-  if not ir.MemRefType.isinstance(a.type):
-    raise ValueError(f"A must be a memref, got {a.type}")
   if not ir.MemRefType.isinstance(b.type):
     raise ValueError(f"B must be a memref, got: {b.type}")
   (k, n), element_type = mma_utils.tiled_memref_shape(b)
-  (m, k2), element_type2 = mma_utils.tiled_memref_shape(a)
+  if isinstance(a, TMEMRef):
+    m, k2 = a.shape
+    element_type2 = a.dtype
+    if collective:
+      raise NotImplementedError("Collective not supported for TMEMRef")
+    if a.layout != (expected_layout := _infer_tmem_layout(a.shape, collective, packing=2)):
+      raise ValueError(
+          f"A layout mismatch: expected {expected_layout}, got {a.layout}"
+      )
+  else:
+    if not ir.MemRefType.isinstance(a.type):
+      raise ValueError(f"A must be a memref, got {a.type}")
+    (m, k2), element_type2 = mma_utils.tiled_memref_shape(a)
   if k != k2:
     raise ValueError(
         "MMA requires A and B to have the same contraction dimension (K),"
@@ -115,23 +173,29 @@ def mma(
     raise ValueError(
         f"Accumulator shape mismatch: expected {(m, n * num_cta)}, got {d.shape}"
     )
-  if d.layout != (expected_layout := _infer_tmem_layout(d.shape, collective)):
+  if d.layout != (expected_layout := _infer_tmem_layout(d.shape, collective, packing=1)):
     raise ValueError(
         f"Accumulator layout mismatch: expected {expected_layout}, got {d.layout}"
     )
   f32 = ir.F32Type.get()
+  f16 = ir.F16Type.get()
   if element_type == f32 or element_type == ir.BF16Type.get():
     if d.dtype != f32:
       raise ValueError(
           f"MMA with element type {element_type} only supports accumulators"
           f" of type f32, but got: {d.dtype}"
       )
-  elif element_type == ir.F16Type.get():
-    if d.dtype != element_type and d.dtype != f32:
+  elif any(
+      t.isinstance(element_type)
+      for t in {ir.F16Type, ir.Float8E5M2Type, ir.Float8E4M3FNType}
+  ):
+    if d.dtype != f16 and d.dtype != f32:
       raise ValueError(
-          "MMA with element type f16 only supports accumulators of type f32"
-          f" or f16, but got: {d.dtype}"
+          f"MMA with element type {element_type} only supports accumulators of"
+          f" type f32 or f16, but got: {d.dtype}"
       )
+  else:
+    raise NotImplementedError(f"Unsupported element type: {element_type}")
 
   # Step 2. Decide on the instruction shapes we'll use. Note that with swizzles,
   # instructions must be issued in groups of the same width as the swizzle.
@@ -153,22 +217,27 @@ def mma(
   m_groups = m // m_group_elems
   k_groups = k // k_group_elems
   n_groups = n // n_group_elems
-  # TODO(apaszke): Require users to bitcast input refs to tf32 before WGMMA.
-  wgmma_element_type = (
+  # TODO(apaszke): Require users to bitcast input refs to tf32 before MMA.
+  mma_element_type = (
       ir.FloatTF32Type.get() if element_type == ir.F32Type.get() else element_type
   )
 
   # Step 3. Compute the operand descriptors.
-  (
-      (a_desc_base, a_k_instr_stride),
-      (a_m_group_stride, a_k_group_stride),
-      a_fastest,
-  ) = mma_utils.create_descriptor(
-      a,
-      swizzle=swizzle,
-      group_size=(m_group_elems, k_group_elems),
-      logical_k_major=False,
-  )
+  if not isinstance(a, TMEMRef):
+    (
+        (a_desc_base, a_k_instr_stride),
+        (a_m_group_stride, a_k_group_stride),
+        a_fastest,
+    ) = mma_utils.create_descriptor(
+        a,
+        swizzle=swizzle,
+        group_size=(m_group_elems, k_group_elems),
+        logical_k_major=False,
+    )
+  else:
+    a_fastest = mma_utils.Dim.K
+    a_k_instr_stride = None
+    a_m_group_stride = a_k_group_stride = a_desc_base = None
   (
       (b_desc_base, b_k_instr_stride),
       (b_n_group_stride, b_k_group_stride),
@@ -184,8 +253,11 @@ def mma(
   true = arith.constant(ir.IntegerType.get_signless(1), 1)
   n_collective_group_elems = n_group_elems * num_cta
   for mi, ni, ki in np.ndindex(m_groups, n_groups, k_groups):
-    a_offset = mi * a_m_group_stride + ki * a_k_group_stride
-    a_mk = arith.addi(a_desc_base, utils.c(mma_utils.encode_addr(a_offset), i64))
+    if isinstance(a, TMEMRef):
+      a_mk = a.slice(slice(None), utils.ds(ki * k_group_elems, k_group_elems)).address
+    else:
+      a_offset = mi * a_m_group_stride + ki * a_k_group_stride
+      a_mk = arith.addi(a_desc_base, utils.c(mma_utils.encode_addr(a_offset), i64))
     b_offset = ni * b_n_group_stride + ki * b_k_group_stride
     b_nk = arith.addi(b_desc_base, utils.c(mma_utils.encode_addr(b_offset), i64))
     if m_groups != 1:
@@ -207,17 +279,17 @@ def mma(
         b_k_stride=b_k_instr_stride,
         accumulate=acc,
         swizzle=swizzle,
-        element_type=wgmma_element_type,
+        element_type=mma_element_type,
     )
 
 
 def _do_mma(
     d_addr: ir.Value,
-    a_desc: ir.Value,
+    a_desc_or_addr: ir.Value,  # TMEM address if a_k_stride is None
     b_desc: ir.Value,
     a_transpose: bool,
     b_transpose: bool,
-    a_k_stride: int,
+    a_k_stride: int | None,
     b_k_stride: int,
     m: int,
     n: int,
@@ -228,14 +300,21 @@ def _do_mma(
     collective: bool,
 ):
   i1 = ir.IntegerType.get_signless(1)
+  i32 = ir.IntegerType.get_signless(32)
   i64 = ir.IntegerType.get_signless(64)
-  kn_tiling = swizzle // utils.bytewidth(element_type)
-  instr_k = 32 // utils.bytewidth(element_type)
-  if a_k_stride % 16 or b_k_stride % 16:
+  elem_bytewidth = utils.bytewidth(element_type)
+  kn_tiling = swizzle // elem_bytewidth
+  instr_k = 32 // elem_bytewidth
+  packing = 4 // elem_bytewidth
+  if (a_k_stride is not None and a_k_stride % 16) or b_k_stride % 16:
     raise ValueError
 
   if ir.F16Type.isinstance(element_type) or ir.BF16Type.isinstance(element_type):
     kind = "f16"
+  elif ir.Float8E5M2Type.isinstance(element_type):
+    kind = "f8f6f4"
+  elif ir.Float8E4M3FNType.isinstance(element_type):
+    kind = "f8f6f4"
   else:
     raise NotImplementedError(f"Unsupported input element type: {element_type}")
 
@@ -243,16 +322,27 @@ def _do_mma(
   i_desc = create_instr_descriptor(
       m * num_cta, n * num_cta, d_type, element_type, a_transpose, b_transpose
   )
+  a_in_tmem = a_k_stride is None
+  a_ptx = "[$1]" if a_in_tmem else "$1"
+  a_ptx_constraint = "r" if a_in_tmem else "l"
+  assert a_desc_or_addr.type == ir.IntegerType.get_signless(32 if a_in_tmem else 64)
   for _ in range(kn_tiling // instr_k):
     llvm.inline_asm(
         ir.Type.parse("!llvm.void"),
-        [d_addr, a_desc, b_desc, i_desc, accumulate],
-        f"tcgen05.mma.cta_group::{num_cta}.kind::{kind} [$0], $1, $2, $3, $4;",
-        "r,l,l,r,b",
+        [d_addr, a_desc_or_addr, b_desc, i_desc, accumulate],
+        f"tcgen05.mma.cta_group::{num_cta}.kind::{kind} [$0], {a_ptx}, $2, $3, $4;",
+        f"r,{a_ptx_constraint},l,r,b",
         has_side_effects=True,
     )
     accumulate = arith.constant(i1, 1)
-    a_desc = arith.addi(a_desc, arith.constant(i64, a_k_stride >> 4))
+    if not a_in_tmem:
+      a_desc_or_addr = arith.addi(
+          a_desc_or_addr, arith.constant(i64, a_k_stride >> 4)
+      )
+    else:
+      a_desc_or_addr = arith.addi(
+          a_desc_or_addr, arith.constant(i32, instr_k // packing)
+      )
     b_desc = arith.addi(b_desc, arith.constant(i64, b_k_stride >> 4))
 
 
@@ -288,6 +378,19 @@ def commit_arrive(
   )
 
 
+def _alloc_ncols(ncols: int, exact: bool):
+  if exact:
+    if ncols.bit_count() != 1 or not 32 <= ncols <= 512:
+      raise ValueError(f"ncols must be a power of 2 and within [32, 512], got: {ncols}")
+  else:
+    ncols = max(32, 1 << (ncols - 1).bit_length())
+    if ncols > 512:
+      raise ValueError(
+          f"After rounding up, got {ncols} columns, exceeding the limit of 512"
+      )
+  return ncols
+
+
 def tmem_alloc(tmem_addr: ir.Value, ncols: int, collective: bool = False, exact: bool = True):
   if ir.MemRefType.isinstance(tmem_addr.type):
     ref_ty = ir.MemRefType(tmem_addr.type)
@@ -300,15 +403,7 @@ def tmem_alloc(tmem_addr: ir.Value, ncols: int, collective: bool = False, exact:
     tmem_addr = utils.memref_ptr(tmem_addr, memory_space=3)
   elif tmem_addr.type != ir.Type.parse("!llvm.ptr<3>"):
     raise ValueError(f"tmem_addr must be an SMEM pointer or a memref, got: {tmem_addr.type}")
-  if exact:
-    if ncols.bit_count() != 1 or not 32 <= ncols <= 512:
-      raise ValueError(f"ncols must be a power of 2 and within [32, 512], got: {ncols}")
-  else:
-    ncols = max(32, 1 << (ncols - 1).bit_length())
-    if ncols > 512:
-      raise ValueError(
-          f"After rounding up, got {ncols} columns, exceeding the limit of 512"
-      )
+  ncols = _alloc_ncols(ncols, exact)
   num_cta = 2 if collective else 1
   return llvm.inline_asm(
       ir.Type.parse("!llvm.void"),
@@ -318,19 +413,37 @@ def tmem_alloc(tmem_addr: ir.Value, ncols: int, collective: bool = False, exact:
       has_side_effects=True,
   )
 
-def tmem_relinquish_alloc_permit():
+
+def tmem_dealloc(tmem_addr: ir.Value, ncols: int, collective: bool = False, exact: bool = True):
+  if tmem_addr.type != ir.IntegerType.get_signless(32):
+    raise ValueError(f"tmem_addr must be an i32, got: {tmem_addr.type}")
+  ncols = _alloc_ncols(ncols, exact)
+  num_cta = 2 if collective else 1
+  return llvm.inline_asm(
+      ir.Type.parse("!llvm.void"),
+      [tmem_addr],
+      f"tcgen05.dealloc.cta_group::{num_cta}.sync.aligned.b32  $0, {ncols};",
+      "r",
+      has_side_effects=True,
+  )
+
+
+def tmem_relinquish_alloc_permit(collective: bool):
+  num_cta = 2 if collective else 1
   return llvm.inline_asm(
       ir.Type.parse("!llvm.void"),
       [],
-      "tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned;",
+      f"tcgen05.relinquish_alloc_permit.cta_group::{num_cta}.sync.aligned;",
       "",
       has_side_effects=True,
   )
 
-def _tmem_access_helper(shape, num, packing: int = 1):
+def _tmem_access_helper(shape, num):
   if num.bit_count() != 1 or num > 128:
     raise ValueError(f"num must be a power of 2 and <= 128, got: {num}")
   match shape:
+    case "32x32b":
+      num_regs = 1
     case "16x128b":
       num_regs = 2
     case "16x256b":
@@ -348,15 +461,10 @@ def _tmem_access_helper(shape, num, packing: int = 1):
   return num_regs, regs_vector
 
 
-def tmem_load(tmem_addr, shape, num, packing: int = 1):
+def tmem_load(tmem_addr, shape, num, pack: bool):
   i32 = ir.IntegerType.get_signless(32)
-  num_out_regs, regs_vector = _tmem_access_helper(shape, num, packing)
-  if packing == 1:
-    pack_mod = ""
-  elif packing == 2:
-    pack_mod = ".pack::16b"
-  else:
-    raise ValueError(f"Unsupported packing: {packing}")
+  num_out_regs, regs_vector = _tmem_access_helper(shape, num)
+  pack_mod = ".pack::16b" if pack else ""
   regs = llvm.inline_asm(
       ir.Type.parse(
           "!llvm.struct<(" + ",".join("i32" for _ in range(num_out_regs)) + ")>"
@@ -369,14 +477,9 @@ def tmem_load(tmem_addr, shape, num, packing: int = 1):
   return [llvm.extractvalue(i32, regs, [i]) for i in range(num_out_regs)]
 
 
-def tmem_store(tmem_addr, shape, num, regs, packing: int = 1):
-  num_out_regs, regs_vector = _tmem_access_helper(shape, num, packing)
-  if packing == 1:
-    pack_mod = ""
-  elif packing == 2:
-    pack_mod = ".unpack::16b"
-  else:
-    raise ValueError(f"Unsupported packing: {packing}")
+def tmem_store(tmem_addr, shape, num, regs, unpack: bool):
+  num_out_regs, regs_vector = _tmem_access_helper(shape, num)
+  pack_mod = ".unpack::16b" if unpack else ""
   llvm.inline_asm(
       ir.Type.parse("!llvm.void"),
       [*regs, tmem_addr],
@@ -419,6 +522,7 @@ class TMEMLayout:
   """
   elements_in_tile: tuple[int, int]
   column_tile_stride: int = 1
+  packing: int = 1
 
   def __post_init__(self):
     row_tiling = self.elements_in_tile[0]
@@ -428,24 +532,36 @@ class TMEMLayout:
       )
     if row_tiling.bit_count() != 1:
       raise ValueError(f"Row tiling must be a power of 2, got: {row_tiling}")
+    if self.elements_in_tile[1] % self.packing:
+      raise ValueError(
+          f"Column tiling must be a multiple of packing={self.packing}, got:"
+          f" {self.elements_in_tile[1]}"
+      )
 
-  def check_shape(self, shape: tuple[int, ...]):
+  def check_type(self, shape: tuple[int, ...], dtype: ir.Type):
     if len(shape) != 2:
       raise ValueError(f"TMEM can only represent 2D shapes, got {shape}")
     if any(s % t for s, t in zip(shape, self.elements_in_tile)):
       raise ValueError(
           f"{shape} is divisible into tiles of shape {self.elements_in_tile}"
       )
+    if self.packing not in {1, fully_packed := 32 // utils.bitwidth(dtype)}:
+      raise ValueError(
+          f"For {utils.bitwidth(dtype)}-bit types, only packing=1 and"
+          f" packing={fully_packed} are supported, but got: {self.packing}"
+      )
 
   def cols_in_shape(self, shape: tuple[int, int]):
-    cols_in_tile = self.elements_in_tile[1]
+    cols_in_tile = self.elements_in_tile[1] // self.packing
     tiles_in_row = TMEM_ROWS // self.elements_in_tile[0]
     num_tiles = math.prod(utils.tile_shape(shape, self.elements_in_tile)[:-2])
     assert num_tiles % tiles_in_row == 0
     return num_tiles // tiles_in_row * cols_in_tile
 
 
-def _infer_tmem_layout(shape: tuple[int, int], collective: bool) -> TMEMLayout:
+def _infer_tmem_layout(
+    shape: tuple[int, int], collective: bool, packing: int = 1
+) -> TMEMLayout:
   if shape[0] > TMEM_ROWS:
     raise ValueError(
         "Can only infer TMEM layout for shapes with at most 128 rows, got:"
@@ -467,9 +583,11 @@ def _infer_tmem_layout(shape: tuple[int, int], collective: bool) -> TMEMLayout:
         f" multiple of 8, got: {shape[1]}"
     )
   if collective and shape[1] == 512:
-    return TMEMLayout(elements_in_tile=(shape[0], 128), column_tile_stride=2)
+    return TMEMLayout(
+        elements_in_tile=(shape[0], 128), column_tile_stride=2, packing=packing
+    )
   else:
-    return TMEMLayout(elements_in_tile=(shape[0], 8))
+    return TMEMLayout(elements_in_tile=(shape[0], 8), packing=packing)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -510,21 +628,27 @@ class TMEMRef:
         )
       layout = _infer_tmem_layout(shape, collective)
     else:
-      layout.check_shape(shape)
+      layout.check_type(shape, dtype)
     # TODO: Do we have to do this??
     # warp_idx = utils.warp_idx(sync=False)
     # tmem_addr = arith.ori(tmem_addr, arith.shli(warp_idx, utils.c(21, i32)))
     return cls(tmem_addr, shape, dtype, layout)
 
   def slice(self, *idxs):
+    i32 = ir.IntegerType.get_signless(32)
     base_idx, slice_shape, is_squeezed = utils.parse_indices(idxs, self.shape)
     if any(is_squeezed):
       raise ValueError("TMEM can only be sliced, not indexed")
-    if self.layout != TMEMLayout(elements_in_tile=(TMEM_ROWS, 8)):
-      raise NotImplementedError(
-          "Slicing only implemented for refs with standard layout, got:"
-          f" {self.layout}"
-      )
+    match self.layout:
+      case TMEMLayout(elements_in_tile=(r, 8), packing=packing) if (
+          r == TMEM_ROWS
+      ):
+        pass
+      case _:
+        raise NotImplementedError(
+            "Slicing only implemented for refs with standard layout, got:"
+            f" {self.layout}"
+        )
     if base_idx[0] != 0 or slice_shape[0] != TMEM_ROWS:
       raise NotImplementedError("TMEM cannot be sliced along rows")
     if slice_shape[1] % 8:
@@ -533,7 +657,9 @@ class TMEMRef:
       )
     col_idx = base_idx[1]
     if not isinstance(col_idx, ir.Value):
-      col_idx = arith.constant(ir.IntegerType.get_signless(32), col_idx)
+      col_idx = arith.constant(i32, col_idx)
+    if packing != 1:
+      col_idx = arith.divui(col_idx, arith.constant(i32, packing))
     return TMEMRef(
         address=arith.addi(self.address, col_idx),
         shape=tuple(slice_shape),
@@ -541,60 +667,69 @@ class TMEMRef:
         dtype=self.dtype,
     )
 
-  def __getitem__(self, *idxs):
+  def load(self, layout: fa.TiledLayout = LAYOUT):
     i32 = ir.IntegerType.get_signless(32)
-    base_idxs, slice_shape, is_squeezed = utils.parse_indices(idxs, self.shape)
-    if any(is_squeezed):
-      raise ValueError("TMEM loads only support slicing")
-    if any(idx != 0 for idx in base_idxs) or tuple(slice_shape) != self.shape:
-      raise NotImplementedError("Slicing of TMEM not impelmented yet")
     if self.shape[1] % 8:
       raise NotImplementedError
     if utils.bitwidth(self.dtype) not in {16, 32}:
       raise NotImplementedError(f"Unsupported dtype: {self.dtype}")
-    layout = _m128_layout(self.shape)
-    regs_shape = layout.registers_shape(self.shape)
-    if self.layout == TMEMLayout(elements_in_tile=(TMEM_ROWS, 8)):
-      # load_32xcols returns a 4xN array, but the FA tiling we use here tiles
-      # columns before rows, and so it is Nx4 (after ignoring all 1 dims).
-      registers = _load_32xcols(
-          self.address, self.shape[1], self.dtype
-      ).T.reshape(regs_shape)
-    elif self.layout == TMEMLayout(elements_in_tile=(TMEM_ROWS, 128), column_tile_stride=2):
-      if self.shape[1] % 128 != 0:
-        raise ValueError(
-            f"TMEM layout {self.layout} is not compatible with shape {self.shape}"
-        )
-      num_column_tiles = self.shape[1] // 128
-      column_tile_stride = self.layout.column_tile_stride
-      num_strided_col_groups = utils.ceil_div(num_column_tiles, column_tile_stride)
-      tiles = []
-      for col_tile_base in range(num_strided_col_groups):
-        for col_tile in range(col_tile_base, num_column_tiles, column_tile_stride):
-          tiles.append(
-              _load_32xcols(
-                  arith.addi(self.address, arith.constant(i32, col_tile * 128)),
-                  cols=128,
-                  dtype=self.dtype,
+    if layout == LAYOUT:
+      regs_shape = layout.registers_shape(self.shape)
+      match self.layout:
+        case TMEMLayout(elements_in_tile=(r, 8), packing=packing) if (
+            r == TMEM_ROWS
+        ):
+          # load_32xcols returns a 4xN array, but the FA tiling we use here tiles
+          # columns before rows, and so it is Nx4 (after ignoring all 1 dims).
+          registers = _load_32xcols(
+              self.address, self.shape[1], self.dtype, packing
+          ).T.reshape(regs_shape)
+        case TMEMLayout(elements_in_tile=(r, 128), column_tile_stride=2) if r == TMEM_ROWS:
+          if self.shape[1] % 128 != 0:
+            raise ValueError(
+                f"TMEM layout {self.layout} is not compatible with shape {self.shape}"
+            )
+          num_column_tiles = self.shape[1] // 128
+          column_tile_stride = self.layout.column_tile_stride
+          num_strided_col_groups = utils.ceil_div(num_column_tiles, column_tile_stride)
+          tiles = []
+          for col_tile_base in range(num_strided_col_groups):
+            for col_tile in range(col_tile_base, num_column_tiles, column_tile_stride):
+              tiles.append(
+                  _load_32xcols(
+                      arith.addi(self.address, arith.constant(i32, col_tile * 128)),
+                      cols=128,
+                      dtype=self.dtype,
+                      tmem_packing=1,
+                  )
               )
+          registers = np.concatenate(tiles, axis=1).T.reshape(regs_shape)
+        case _:
+          raise NotImplementedError(
+              f"Loads only implemented for refs with standard layout, got: {self.layout}"
           )
-      registers = np.concatenate(tiles, axis=1).T.reshape(regs_shape)
+    elif layout == TMEM_NATIVE_LAYOUT:
+      regs_shape = layout.registers_shape(self.shape)
+      match self.layout:
+        case TMEMLayout(elements_in_tile=(r, c), packing=packing) if (
+            r == TMEM_ROWS and c % 2 == 0
+        ):
+          registers = _load_32xcols_native(
+              self.address, self.shape[1], self.dtype, packing
+          ).reshape(regs_shape)
+        case _:
+          raise NotImplementedError(
+              "Loads only implemented for refs with standard layout, got:"
+              f" {self.layout}"
+          )
     else:
-      raise NotImplementedError(
-          f"Loads only implemented for refs with standard layout, got: {self.layout}"
+      raise ValueError(
+          "TMEM loads can only produce results in the tcgen05 layouts"
+          f" ({LAYOUT} and {TMEM_NATIVE_LAYOUT}), but got: {layout}"
       )
     return fa.FragmentedArray(_registers=registers, _layout=layout, _is_signed=None)
 
-  def __setitem__(self, idxs, value):
-    if not isinstance(idxs, tuple):
-      idxs = (idxs,)
-    base_idxs, slice_shape, is_squeezed = utils.parse_indices(idxs, self.shape)
-    if any(is_squeezed):
-      raise ValueError(
-          "TMEM stores don't support integer indexing (only slices allowed)"
-      )
-    if any(idx != 0 for idx in base_idxs) or tuple(slice_shape) != self.shape:
-      raise NotImplementedError("Slicing parts of TMEM not implemented yet")
+  def store(self, value):
     if self.shape[1] % 8:
       raise NotImplementedError
     if utils.bitwidth(self.dtype) not in {16, 32}:
@@ -611,51 +746,113 @@ class TMEMRef:
           f"Stored array has dtype {value.mlir_dtype}, but TMEM has dtype"
           f" {self.dtype}"
       )
-    if value.layout != LAYOUT:
+    if value.layout == LAYOUT:
+      # TODO(apaszke): Collective MMA layout
+      match self.layout:
+        case TMEMLayout(elements_in_tile=(r, 8), packing=packing) if (
+            r == TMEM_ROWS
+        ):
+          # store_32xcols needs a 4xN array, but the FA tiling we use here tiles
+          # columns before rows, and so it is Nx4 (after ignoring all 1 dims).
+          _store_32xcols(
+              self.address, value.registers.T.reshape((4, -1)), packing
+          )
+        case _:
+          raise NotImplementedError(
+              f"Stores only implemented for refs with standard layout, got: {self.layout}"
+          )
+    elif value.layout == TMEM_NATIVE_LAYOUT:
+      # TODO(apaszke): Collective MMA layout
+      match self.layout:
+        case TMEMLayout(elements_in_tile=(r, c), packing=packing) if (
+            r == TMEM_ROWS and c % 2 == 0
+        ):
+          _store_32xcols_native(
+              self.address, value.registers.reshape(-1), packing
+          )
+        case _:
+          raise NotImplementedError(
+              f"Stores only implemented for refs with standard layout, got: {self.layout}"
+          )
+    else:
       raise ValueError(
-          f"Stored array has layout {value.layout}, but only tcgen05.LAYOUT is"
-          " supported"
-      )
-    if self.layout == TMEMLayout(elements_in_tile=(TMEM_ROWS, 8)):
-      # store_32xcols needs a 4xN array, but the FA tiling we use here tiles
-      # columns before rows, and so it is Nx4 (after ignoring all 1 dims).
-      _store_32xcols(
-          self.address, value.registers.T.reshape((4, -1))
-      )
-    else:  # TODO(apaszke): Collective MMA layout
-      raise NotImplementedError(
-          f"Stores only implemented for refs with standard layout, got: {self.layout}"
+          f"Stored array has layout {value.layout}, but only tcgen05.LAYOUT and"
+          " tcgen05.TMEM_NATIVE_LAYOUT are supported"
       )
 
+  def _debug_print(self):
+    i32 = ir.IntegerType.get_signless(32)
+    num_cols = self.layout.cols_in_shape(self.shape)
+    lane = arith.remui(utils.thread_idx(), arith.constant(i32, utils.WARPGROUP_SIZE))
+    for c in range(num_cols):
+      val = llvm.inline_asm(
+          i32,
+          [arith.addi(self.address, arith.constant(i32, c))],
+          "tcgen05.ld.sync.aligned.32x32b.x1.b32 {$0}, [$1];",
+          "=r,r",
+      )
+      dtype_bitwidth = utils.bitwidth(self.dtype)
+      full_packing = 32 // dtype_bitwidth
+      if self.layout.packing == 1:
+        if dtype_bitwidth < 32:
+          val = arith.trunci(ir.IntegerType.get_signless(dtype_bitwidth), val)
+        val = utils.bitcast(val, self.dtype)
+      elif self.layout.packing == full_packing:
+        val = utils.bitcast(val, ir.VectorType.get((full_packing,), self.dtype))
+      else:
+        raise NotImplementedError(f"Unsupported packing: {self.layout.packing}")
+      # TODO(apaszke): Make this print logical, not physical location.
+      utils.debug_print(f"[{{}}, {c}]: {{}}", lane, val, uniform=False)
 
-def _transfer_32xcols(base_addr, cols):
+
+def _transfer_32xcols(
+    base_addr: ir.Value,
+    cols: int,
+    atom_shape: tuple[int, int],
+    tmem_packing: int,
+    reg_packing: int,
+):
+  """Generates a sequence of parameters for a given TMEM read or write.
+
+  Arguments:
+    base_addr: The base address of the TMEM region.
+    cols: The number of logical columns to transfer.
+    atom_shape: The logical shape of the tile written by the warp in a single
+      TMEM transfer.
+    tmem_packing: Packing degree in TMEM. When packing is 1, but the data is
+      16-bit, we expect that each transfer actually involves double the number
+      of physical columns.
+    reg_packing: The number of elements that fit in a single 32-bit register.
+  """
   i32 = ir.IntegerType.get_signless(32)
-  cols_per_num = 8  # Here we generate a plan compatible with tcgen05.LAYOUT.
-  assert cols % cols_per_num == 0
-  total_num = cols // cols_per_num
-  if total_num <= 32:
-    instr_num = total_num
-  elif total_num == 64:
-    instr_num = 32
-  else:
-    raise NotImplementedError(total_num)
-  # We transfer 16 lanes at a time, but have 32 to deal with.
-  for lane_step in range(2):
-    addr_row = arith.addi(base_addr, utils.c((lane_step * 16) << 16, i32))
-    cols_per_instr = instr_num * cols_per_num
+  atom_rows, atom_cols = atom_shape
+  assert cols % atom_cols == 0
+  total_num = cols // atom_cols
+  assert total_num.bit_count() == 1
+  regs_per_instr = atom_shape[0] * atom_shape[1] // (utils.WARP_SIZE * reg_packing)
+  # We artificially lower the instr_num compared to its limits, because higher
+  # values can lead to register spills..
+  instr_num = min(total_num, 64 // regs_per_instr)
+  assert 32 % atom_rows == 0
+  num_row_steps = 32 // atom_rows
+  for lane_step in range(num_row_steps):
+    addr_row = arith.addi(base_addr, utils.c((lane_step * atom_rows) << 16, i32))
+    cols_per_instr = instr_num * atom_cols
     for num_step in range(total_num // instr_num):
       num_slice = slice(num_step * instr_num, (num_step + 1) * instr_num)
-      addr_row_col = arith.addi(addr_row, utils.c(num_step * cols_per_instr, i32))
+      addr_row_col = arith.addi(
+          addr_row, utils.c(num_step * cols_per_instr // tmem_packing, i32)
+      )
       yield addr_row_col, instr_num, lane_step, num_slice
 
 
-def _store_32xcols(base_addr, vector_regs):
+def _store_32xcols(base_addr, vector_regs, tmem_packing):
   i32 = ir.IntegerType.get_signless(32)
   assert vector_regs.ndim == 2 and vector_regs.shape[0] == 4
   cols = vector_regs.shape[1] * 8
 
-  packing = 64 // utils.bitwidth(vector_regs.flat[0].type)
-  if packing == 1:
+  reg_packing = 64 // utils.bitwidth(vector_regs.flat[0].type)
+  if reg_packing == 1:
     store_shape = "16x256b"  # 4 threads * 64 bits per vreg = 256 bits
     regs = np.empty((4, vector_regs.shape[1], 2), dtype=object)
     c0 = arith.constant(i32, 0)
@@ -668,43 +865,83 @@ def _store_32xcols(base_addr, vector_regs):
     # minor dim traversing columns and major being 8 rows apart.
     # See https://docs.nvidia.com/cuda/parallel-thread-execution/#tcgen05-matrix-fragments-shape-16256b
     assert regs.shape[-2:] == (2, 2)
-  elif packing == 2:
+    assert tmem_packing == 1
+    unpack = False
+  elif reg_packing == 2:
     store_shape = "16x128b"  # 4 threads * 32 bits per vreg = 128 bits
     # From a single lane perspective a num tile has 2 registers, 8 rows apart.
     # See https://docs.nvidia.com/cuda/parallel-thread-execution/#tcgen05-matrix-fragments-shape-16128b
     regs = vector_regs.reshape(2, 2, vector_regs.shape[1]).swapaxes(1, 2)
+    assert 1 <= tmem_packing <= 2
+    unpack = tmem_packing == 1
   else:
-    raise NotImplementedError(packing)
+    raise NotImplementedError(reg_packing)
 
-  it = _transfer_32xcols(base_addr, cols)
+  it = _transfer_32xcols(base_addr, cols, (16, 8), tmem_packing, reg_packing)
   for addr_row_col, instr_num, lane_step, num_slice in it:
     regs_slice = regs[lane_step, num_slice].flat
-    tmem_store(addr_row_col, store_shape, instr_num, regs_slice, packing)
+    tmem_store(addr_row_col, store_shape, instr_num, regs_slice, unpack)
 
 
-def _load_32xcols(base_addr, cols, dtype):
+def _store_32xcols_native(base_addr, vector_regs, tmem_packing):
+  i32 = ir.IntegerType.get_signless(32)
+  assert vector_regs.ndim == 1
+  cols = len(vector_regs) * TMEM_NATIVE_LAYOUT.vector_length
+
+  reg_packing = 64 // utils.bitwidth(vector_regs.flat[0].type)
+  store_shape = "32x32b"
+  if reg_packing == 1:
+    store_atom_shape = (32, 1)
+    regs = [None] * (len(vector_regs) * 2)
+    c0 = arith.constant(i32, 0)
+    c1 = arith.constant(i32, 1)
+    for idx, vreg in enumerate(vector_regs):
+      regs[2 * idx] = llvm.extractelement(vreg, c0)
+      regs[2 * idx + 1] = llvm.extractelement(vreg, c1)
+    assert tmem_packing == 1
+    unpack = False
+  elif reg_packing == 2:
+    store_atom_shape = (32, 2)
+    regs = vector_regs
+    assert 1 <= tmem_packing <= 2
+    unpack = tmem_packing == 1
+  else:
+    raise NotImplementedError(reg_packing)
+
+  it = _transfer_32xcols(base_addr, cols, store_atom_shape, tmem_packing, reg_packing)
+  for addr_row_col, instr_num, lane_step, num_slice in it:
+    assert lane_step == 0
+    regs_slice = regs[num_slice]
+    tmem_store(addr_row_col, store_shape, instr_num, regs_slice, unpack)
+
+
+def _load_32xcols(base_addr, cols, dtype, tmem_packing):
   i32 = ir.IntegerType.get_signless(32)
   vec_ty = ir.VectorType.get((2,), dtype)
-  packing = 32 // utils.bitwidth(dtype)
-  if packing == 1:
+  reg_packing = 32 // utils.bitwidth(dtype)
+  if reg_packing == 1:
     load_shape = "16x256b"  # 4 threads * 64 bits per vreg = 256 bits
-  elif packing == 2:
+    assert tmem_packing == 1
+    pack = False
+  elif reg_packing == 2:
     load_shape = "16x128b"  # 4 threads * 32 bits per vreg = 128 bits
+    assert 1 <= tmem_packing <= 2
+    pack = tmem_packing == 1
   else:
-    raise NotImplementedError(packing)
+    raise NotImplementedError(reg_packing)
 
   vector_regs = np.ndarray((4, cols // 8), dtype=object)
 
-  it = _transfer_32xcols(base_addr, cols)
+  it = _transfer_32xcols(base_addr, cols, (16, 8), tmem_packing, reg_packing)
   c0 = arith.constant(i32, 0)
   c1 = arith.constant(i32, 1)
   for addr_row_col, instr_num, lane_step, num_slice in it:
-    regs = tmem_load(addr_row_col, load_shape, instr_num, packing)
+    regs = tmem_load(addr_row_col, load_shape, instr_num, pack)
     row_slice = slice(lane_step * 2, (lane_step + 1) * 2)
     # This aliases the original array, so updates will be reflected there.
     vector_regs_update = vector_regs[row_slice, num_slice]
     assert vector_regs_update.shape == (2, instr_num), (vector_regs_update.shape, instr_num)
-    if packing == 1:
+    if reg_packing == 1:
       regs = [llvm.bitcast(dtype, r) for r in regs]
       # From a single lane perspective a num tile consists of a 2x2, with the
       # minor dim traversing columns and major being 8 rows apart.
@@ -717,7 +954,7 @@ def _load_32xcols(base_addr, cols, dtype):
         vreg = llvm.insertelement(high_undef, regs[(*idx, 1)], c1)
         vector_regs_update[idx] = vreg
     else:
-      assert packing == 2
+      assert reg_packing == 2
       regs = [llvm.bitcast(vec_ty, r) for r in regs]
       # From a single lane perspective a num tile has 2 registers, 8 rows apart.
       # See https://docs.nvidia.com/cuda/parallel-thread-execution/#tcgen05-matrix-fragments-shape-16128b
@@ -727,21 +964,56 @@ def _load_32xcols(base_addr, cols, dtype):
   return vector_regs
 
 
+def _load_32xcols_native(base_addr, cols, dtype, tmem_packing):
+  i32 = ir.IntegerType.get_signless(32)
+  vec_ty = ir.VectorType.get((2,), dtype)
+  reg_packing = 32 // utils.bitwidth(dtype)
+  load_shape = "32x32b"
+  if reg_packing == 1:
+    load_atom_shape = (32, 1)
+    assert tmem_packing == 1
+    pack = False
+  elif reg_packing == 2:
+    load_atom_shape = (32, 2)
+    assert 1 <= tmem_packing <= 2
+    pack = tmem_packing == 1
+  else:
+    raise NotImplementedError(reg_packing)
+
+  it = _transfer_32xcols(base_addr, cols, load_atom_shape, tmem_packing, reg_packing)
+  c0 = arith.constant(i32, 0)
+  c1 = arith.constant(i32, 1)
+  regs = [None] * (cols // reg_packing)
+  for addr_row_col, instr_num, lane_step, num_slice in it:
+    assert lane_step == 0, lane_step
+    instr_regs = tmem_load(addr_row_col, load_shape, instr_num, pack)
+    if reg_packing == 1:
+      regs[num_slice] = [llvm.bitcast(dtype, r) for r in instr_regs]
+    else:
+      assert reg_packing == 2
+      regs[num_slice] = [llvm.bitcast(vec_ty, r) for r in instr_regs]
+
+  if reg_packing == 1:
+    vector_regs = np.ndarray((cols // 2,), dtype=object)
+    undef = llvm.mlir_undef(vec_ty)
+    for idx in range(vector_regs.size):
+      high_undef = llvm.insertelement(undef, regs[2 * idx], c0)
+      vreg = llvm.insertelement(high_undef, regs[2 * idx + 1], c1)
+      vector_regs[idx] = vreg
+  else:
+    assert reg_packing == 2
+    vector_regs = np.asarray(regs, dtype=object)
+
+  assert vector_regs.shape == (cols // TMEM_NATIVE_LAYOUT.vector_length,)
+  return vector_regs
+
+
 def _m128_layout(shape: tuple[int, ...]):
   if len(shape) != 2:
     raise ValueError(f"Shape {shape} is not 2D")
   if shape[0] % 128 != 0 or shape[1] % 8 != 0:
     raise ValueError(f"Shape {shape} is not a multiple of 64x8")
   return LAYOUT
-
-# Like WGMMA_LAYOUT, only each warp holds a 32xN strip instead of 16xN.
-# The name is so short, because it's meant to be used qualified (tcgen05.LAYOUT)
-LAYOUT = fa.TiledLayout(
-    fa.Tiling(((128, 8), (32, 8), (8, 8), (1, 2))),
-    warp_dim=-8,
-    lane_dims=(-4, -3),
-    vector_dim=-1,
-)
 
 
 def commit_tmem():

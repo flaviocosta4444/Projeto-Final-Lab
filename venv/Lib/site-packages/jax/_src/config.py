@@ -235,12 +235,11 @@ def trace_context():
           threefry_partitionable.value,
           threefry_gpu_kernel_lowering.value,
           use_direct_linearize.value,
-          varying_axes_in_types.value,
           softmax_custom_jvp.value,
           disable_jit.value,
           debug_key_reuse.value,
           jax_xla_profile_version.value,
-          _check_rep.value,
+          _check_vma.value,
           # Technically this affects jaxpr->stablehlo lowering, not tracing.
           hlo_source_file_canonicalization_regex.value,
           pgle_profiling_runs.value,
@@ -971,6 +970,28 @@ check_tracer_leaks = bool_state(
           'to disable any debuggers while leak checking is enabled.'))
 checking_leaks = functools.partial(check_tracer_leaks, True)
 
+
+captured_constants_warn_bytes = int_state(
+    name='jax_captured_constants_warn_bytes',
+    default=2 * 10 ** 9,
+    help=('The number of bytes of parameters that may be captured as constants '
+          'before a warning is issued. Defaults to approximately 2GB. '
+          'Set to -1 to disable issuing a warning.'
+    )
+)
+
+captured_constants_report_frames = int_state(
+    name='jax_captured_constants_report_frames',
+    default=0,
+    help=('The number of stack frames reported for each captured constant '
+          'indicating the file and operation where the constant was captured. '
+          'Set to -1 to print the complete set of frames, or 0 to disable. '
+          'N.b. the report is only generated if the total amount of captured '
+          'constants exceeds `jax_captured_constants_warn_bytes`, as it is expensive'
+          'to generate the report.'
+    )
+)
+
 debug_nans = bool_state(
     name='jax_debug_nans',
     default=False,
@@ -1015,19 +1036,6 @@ pmap_shmap_merge = bool_state(
     default=False,
     upgrade=True,
     help='If True, pmap and shard_map API will be merged.')
-
-
-spmd_mode = enum_state(
-    name='jax_spmd_mode',
-    enum_values=['allow_all', 'allow_jit'],
-    default='allow_jit',
-    help=("Decides whether Math on ``jax.Array`` objects that are not fully addressable "
-          "(i.e. spans across multiple processes) is allowed. The options are:\n\n"
-          "* ``allow_jit``: Default, ``pjit`` and ``jax.jit`` computations are allowed "
-          "  to execute on non-fully addressable ``jax.Array`` objects\n"
-          "* ``allow_all``: ``jnp``, normal math (like ``a + b``, etc), ``pjit``, "
-          "  ``jax.jit`` and all other operations are allowed to "
-          "  execute on non-fully addressable ``jax.Array`` objects."))
 
 
 distributed_debug = bool_state(
@@ -1092,17 +1100,9 @@ use_direct_linearize = bool_state(
     help=('Use direct linearization instead JVP followed by partial eval'),
     include_in_jit_key=True)
 
-varying_axes_in_types = bool_state(
-    name='jax_varying_axes_in_types',
-    default=True,
-    help=('Adds varying manual axes to ShapedArray to track which mesh axes the'
-          ' array is varying over. This will help to remove the efficient'
-          ' transpose rewrite machinery in shard_map'),
-    include_in_jit_key=True)
-
 # TODO make it so people don't use this, this is internal...
-_check_rep = bool_state(
-    name='check_rep',
+_check_vma = bool_state(
+    name='check_vma',
     default=False,
     help='internal implementation detail of shard_map, DO NOT USE',
     include_in_jit_key=True)
@@ -1816,18 +1816,20 @@ memory_fitting_level = enum_state(
         'O2',
         'O3',
     ],
-    default='UNKNOWN',
+    default='O2',
     help=(
         'The degree to which the compiler should attempt to make the program'
         ' fit in memory'
     ),
-    include_in_jit_key=True
+    include_in_jit_key=True,
 )
+
+DEFAULT_CPU_COLLECTIVES_IMPL = "gloo"
 
 cpu_collectives_implementation = optional_enum_state(
     name='jax_cpu_collectives_implementation',
     enum_values=["gloo", "mpi", "megascale"],
-    default=None,
+    default=DEFAULT_CPU_COLLECTIVES_IMPL,
     help=(
         "Cross-process collective implementation used on CPU. Must be one of "
         '("gloo", "mpi")'),

@@ -32,7 +32,6 @@ from jax._src import sharding_impls
 from jax._src import tree_util
 from jax._src import util
 from jax._src import xla_bridge as xb
-from jax._src.lib import jaxlib_extension_version
 from jax._src.interpreters import ad
 from jax._src.interpreters import batching
 from jax._src.interpreters import mlir
@@ -41,7 +40,7 @@ from jax._src.lax.control_flow.loops import map as lax_map
 from jax._src.lib import xla_client as xc
 from jax._src.lib.mlir import ir
 from jax._src.lib.mlir.dialects import hlo
-from jax._src.sharding_impls import SdyArraySharding, SdyArrayShardingList, SingleDeviceSharding
+from jax._src.sharding_impls import SdyArray, SdyArrayList, SdyDim, SingleDeviceSharding
 from jax._src.typing import DeprecatedArg
 import numpy as np
 
@@ -155,13 +154,15 @@ def _callback_op_sharding(
           " computations"
       )
     if config.use_shardy_partitioner.value:
-      assert len(avals_out) == 1
-      op_sharding = sharding_impls.SdyArrayShardingList([
-          sharding_impls.SdyArraySharding(
+      ndim = 0
+      if avals_out and isinstance(avals_out[0], core.ShapedArray):
+        ndim = avals_out[0].ndim
+      op_sharding = SdyArrayList([
+          SdyArray(
               mesh_shape=(),
-              dimension_shardings=[
-                  sharding_impls.SdyDimSharding(axes=[], is_open=False)
-              ] * avals_out[0].ndim,
+              dim_shardings=[
+                  SdyDim(axes=[], is_open=False)
+              ] * ndim,
               logical_device_ids=())])
     else:
       op_sharding = xc.OpSharding()  # type: ignore[assignment]
@@ -198,10 +199,10 @@ def _callback_op_sharding(
       # number of result ops. If there are no result ops, we need 1 shardy
       # annotation.
       num_sdy_shardings = max(1, len(avals_out))
-      op_sharding = sharding_impls.SdyArrayShardingList(num_sdy_shardings * [
-          sharding_impls.SdyArraySharding(
+      op_sharding = SdyArrayList(num_sdy_shardings * [
+          SdyArray(
               mesh_shape=(),
-              dimension_shardings=[],
+              dim_shardings=[],
               logical_device_ids=(device_index,))])
     else:
       op_sharding = xc.OpSharding()  # type: ignore[assignment]
@@ -591,7 +592,7 @@ def send_to_host(
     operand: Any,
     name: str,
     *,
-    sharding: SdyArrayShardingList | xc.OpSharding | None = None,
+    sharding: SdyArrayList | xc.OpSharding | None = None,
 ) -> ir.Value:
   channel_handle = hlo.ChannelHandle.get(channel, mlir.SEND_TO_HOST_TYPE)
   send_op = hlo.SendOp([operand], token, channel_handle,
@@ -607,11 +608,11 @@ def send_to_host(
       # we need to create an equivalent sharding with no dimensions. If there
       # are multiple shardings, just grab the first one since all these
       # shardings should be the same.
-      assert isinstance(sharding, SdyArrayShardingList)
+      assert isinstance(sharding, SdyArrayList)
       assert len(sharding.shardings) >= 1
-      sharding = SdyArrayShardingList([
-          SdyArraySharding(
-              mesh_shape=(), dimension_shardings=[],
+      sharding = SdyArrayList([
+          SdyArray(
+              mesh_shape=(), dim_shardings=[],
               logical_device_ids=sharding.shardings[0].logical_device_ids)])
     mlir.set_sharding(send_op, sharding)
   return send_op.result
@@ -623,7 +624,7 @@ def receive_from_host(
     out_aval: core.ShapedArray,
     name: str,
     *,
-    sharding: SdyArrayShardingList | xc.OpSharding | None = None,
+    sharding: SdyArrayList | xc.OpSharding | None = None,
 ) -> tuple[ir.Value, ir.Value]:
   channel_handle = hlo.ChannelHandle.get(channel, mlir.RECV_FROM_HOST_TYPE)
   recv_op = hlo.RecvOp([mlir.aval_to_ir_type(out_aval),
@@ -635,7 +636,7 @@ def receive_from_host(
           _xla_host_transfer_rendezvous=ir.StringAttr.get(str(name))))
   if sharding is not None:
     if config.use_shardy_partitioner.value:
-      assert isinstance(sharding, SdyArrayShardingList)
+      assert isinstance(sharding, SdyArrayList)
       assert len(sharding.shardings) >= 1
        # `RecvOp`'s last argument is a `TokenType`. Since Shardy requires the
       # number of shardings to match the number of results, but JAX only sees
@@ -643,10 +644,10 @@ def receive_from_host(
       # Note that even if a function returns N results, we will end up with N
       # `RecvOp`s, so we only need to get the first sharding. All shardings are
       # the same anyways, operating on the same single device ID.
-      sharding = SdyArrayShardingList([
+      sharding = SdyArrayList([
           sharding.shardings[0],
-          SdyArraySharding(
-              mesh_shape=(), dimension_shardings=[],
+          SdyArray(
+              mesh_shape=(), dim_shardings=[],
               logical_device_ids=sharding.shardings[0].logical_device_ids)])
     mlir.set_sharding(recv_op, sharding)
   # Token should be at the end of the results
@@ -684,7 +685,7 @@ def _emit_tpu_python_callback(
     result_avals: Sequence[core.ShapedArray],
     result_shapes: Sequence[xc.Shape],
     *,
-    sharding: SdyArrayShardingList | xc.OpSharding | None = None,
+    sharding: SdyArrayList | xc.OpSharding | None = None,
 ) -> tuple[Sequence[ir.Value], Any]:
   token = token or hlo.create_token()
   _wrapped_callback = callback
@@ -729,21 +730,6 @@ def _emit_tpu_python_callback(
   return outputs, token
 
 
-def _layout_to_mlir_layout(minor_to_major: Sequence[int] | None):
-  if minor_to_major is None:
-    # Needed for token layouts
-    layout: np.ndarray = np.zeros((0,), dtype="int64")
-  else:
-    layout = np.array(minor_to_major, dtype="int64")
-  return ir.DenseIntElementsAttr.get(layout, type=ir.IndexType.get())
-
-
-def _aval_to_default_layouts(aval):
-  avals = [core.physical_aval(aval)]
-  # Row major order is default for `NumPy`.
-  return [list(range(aval.ndim - 1, -1, -1)) for aval in avals]
-
-
 def emit_python_callback(
     ctx: mlir.LoweringRuleContext,
     callback,
@@ -754,9 +740,7 @@ def emit_python_callback(
     *,
     has_side_effect: bool,
     partitioned: bool = False,
-    sharding: SdyArrayShardingList | xc.OpSharding | None = None,
-    operand_layouts: Sequence[Sequence[int] | None] | None = None,
-    result_layouts: Sequence[Sequence[int] | None] | None = None,
+    sharding: SdyArrayList | xc.OpSharding | None = None,
 ) -> tuple[Sequence[mlir.IrValues], Any, Any]:
   """Emits MLIR that calls back to a provided Python function.
 
@@ -771,8 +755,6 @@ def emit_python_callback(
     partitioned: If True, then `callback` is called on local shards only. If
       False, then `callback` is called on all shards.
     sharding: The sharding of the callback.
-    operand_layouts: The layouts of the operands.
-    result_layouts: The layouts of the results.
 
   Returns:
     A tuple of MLIR result values, a new token (if any), and the host callback
@@ -788,22 +770,11 @@ def emit_python_callback(
     if platform not in {"cpu", "cuda", "rocm"}:
       raise ValueError(
           f"Partitioned callback not supported on {platform} backend.")
-    if jaxlib_extension_version < 329:
-      raise ValueError(
-          "Partitioned callback not supported on jaxlib version < 329.")
     if result_avals:
       raise ValueError("Partitioned callback not supported with return values.")
   backend = ctx.module_context.get_backend()
   result_shapes = [_aval_to_xla_shape(aval) for aval in result_avals]
   operand_shapes = [_aval_to_xla_shape(aval) for aval in operand_avals]
-  # Handling layouts
-  if operand_layouts is None:
-    operand_layouts = util.concatenate(
-        map(_aval_to_default_layouts, operand_avals))
-  operand_mlir_layouts = map(_layout_to_mlir_layout, operand_layouts)
-  if result_layouts is None:
-    result_layouts = util.concatenate(map(_aval_to_default_layouts, result_avals))
-  result_mlir_layouts = map(_layout_to_mlir_layout, result_layouts)
 
   # First we apply checks to ensure output shapes and dtypes match the expected
   # ones.
@@ -855,98 +826,51 @@ def emit_python_callback(
         for result_aval in result_avals]
     return outputs, token, None
 
-  # TODO(dsuo): Remove this once we bump minimum_jaxlib_version to "0.5.4".
-  if jaxlib_extension_version <= 320:
-    result_types = mlir.flatten_ir_types([mlir.aval_to_ir_type(aval) for aval in result_avals])
-    if token:
-
-      callback_without_token = _wrapped_callback
-      def _wrapped_callback(token, *args):  # type: ignore  # pylint: disable=function-redefined
-        return (token, *callback_without_token(*args))
-
-      operand_shapes = [
-          _aval_to_xla_shape(core.abstract_token), *operand_shapes
-      ]
-      result_shapes = [
-          _aval_to_xla_shape(core.abstract_token), *result_shapes
-      ]
-      operands = [token, *operands]
-      result_types = [mlir.token_type(), *result_types]
-      operand_mlir_layouts = [_layout_to_mlir_layout(None), *operand_mlir_layouts]
-      result_mlir_layouts = [_layout_to_mlir_layout(None), *result_mlir_layouts]
-    callback_descriptor, ifrt_callback = (
-        backend.get_emit_python_callback_descriptor(_wrapped_callback,
-                                                    operand_shapes,
-                                                    result_shapes))
-    ctx.module_context.add_host_callback(ifrt_callback)
-    descriptor_operand = mlir.ir_constant(callback_descriptor)
-    callback_operands = [descriptor_operand, *operands]
-    if operand_mlir_layouts is not None:
-      operand_mlir_layouts = [_layout_to_mlir_layout([]), *operand_mlir_layouts]
-    result_type = ir.TupleType.get_tuple(result_types)
-    call_target_name = ("xla_python_gpu_callback"
-                      if platform in {"cuda", "rocm"} else "xla_python_cpu_callback")
-    result = hlo.CustomCallOp(
-        [result_type],
-        callback_operands,
-        call_target_name=ir.StringAttr.get(call_target_name),
-        has_side_effect=ir.BoolAttr.get(has_side_effect),
-        api_version=mlir.i32_attr(2),
-        called_computations=ir.ArrayAttr.get([]),
-        backend_config=ir.StringAttr.get(str(callback_descriptor)),
-        operand_layouts=(
-          None if operand_mlir_layouts is None
-          else ir.ArrayAttr.get(operand_mlir_layouts)),
-        result_layouts=(
-          None if result_mlir_layouts is None
-          else ir.ArrayAttr.get(result_mlir_layouts)))
-    if sharding is not None:
-      mlir.set_sharding(result, sharding)
-    results = [
-        hlo.get_tuple_element(result, mlir.i32_attr(i))
-        for i in range(len(result_types))
-    ]
-  else:
-    device = "gpu" if platform in {"cuda", "rocm"} else "cpu"
-    partition = "_partitioned" if partitioned else ""
-    call_target_name = f"xla_ffi{partition}_python_{device}_callback"
-    if token:
-      callback_without_token = _wrapped_callback
-      def _wrapped_callback(token, *args):  # type: ignore  # pylint: disable=function-redefined
-        return (token, *callback_without_token(*args))
-      operands = [token, *operands]
-      if (
-          config.use_shardy_partitioner.value
-          and sharding is not None
-          and len(ctx.avals_out) > 0
-          and isinstance(sharding, sharding_impls.SdyArrayShardingList)
-      ):
-        # Add a sharding annotation for the token if we have at least one
-        # output. Otherwise, the single shardy annotation required of all ops
-        # (even those without any results) can annotate the token.
-        sharding = sharding_impls.SdyArrayShardingList(
-            [*sharding.shardings, sharding.shardings[-1]]
-        )
-      ctx = dataclasses.replace(
-          ctx,
-          avals_in=[core.abstract_token, *ctx.avals_in],
-          avals_out=[core.abstract_token, *ctx.avals_out],
-      )
-
-    # TODO(dsuo): Remove this line once we deprecate the XLA custom call
-    # handler.
-    ifrt_callback = _wrapped_callback
-    ctx.module_context.add_host_callback(ifrt_callback)
-    index = np.uint64(len(ctx.module_context.host_callbacks) - 1)
-    result = ffi.build_ffi_lowering_function(  # type: ignore
-        call_target_name,
-        has_side_effect=has_side_effect,
-    )(ctx, *operands, index=np.uint64(index))
-
-    if sharding is not None:
-      mlir.set_sharding(result, sharding)
-
-    results = result.results  # type: ignore
+  device = "gpu" if platform in {"cuda", "rocm"} else "cpu"
+  partition = "_partitioned" if partitioned else ""
+  call_target_name = f"xla_ffi{partition}_python_{device}_callback"
   if token:
-    token, *results = results
-  return results, token, ifrt_callback
+    callback_without_token = _wrapped_callback
+    def _wrapped_callback(token, *args):  # type: ignore  # pylint: disable=function-redefined
+      return (token, *callback_without_token(*args))
+    operands = [token, *operands]
+    if (
+        config.use_shardy_partitioner.value
+        and sharding is not None
+        and len(ctx.avals_out) > 0
+        and isinstance(sharding, SdyArrayList)
+    ):
+      # Add a sharding annotation for the token if we have at least one
+      # output. Otherwise, the single shardy annotation required of all ops
+      # (even those without any results) can annotate the token.
+      sharding = SdyArrayList([
+          SdyArray(
+              mesh_shape=(),
+              dim_shardings=[],
+              logical_device_ids=()),
+          *sharding.shardings])
+    ctx = dataclasses.replace(
+        ctx,
+        avals_in=[core.abstract_token, *ctx.avals_in],
+        avals_out=[core.abstract_token, *ctx.avals_out],
+    )
+
+  # TODO(dsuo): Remove this line once we deprecate the XLA custom call
+  # handler.
+  ifrt_callback = _wrapped_callback
+  ctx.module_context.add_host_callback(ifrt_callback)
+  index = np.uint64(len(ctx.module_context.host_callbacks) - 1)
+  result = ffi.build_ffi_lowering_function(  # type: ignore
+      call_target_name,
+      has_side_effect=has_side_effect,
+  )(ctx, *operands, index=np.uint64(index))
+
+  if sharding is not None:
+    mlir.set_sharding(result, sharding)
+
+  results = result.results  # type: ignore
+
+  if token:
+    token, *results = results  # type: ignore
+
+  return results, token, ifrt_callback  # type: ignore

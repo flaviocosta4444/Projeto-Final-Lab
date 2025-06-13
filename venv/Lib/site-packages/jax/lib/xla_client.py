@@ -12,7 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import gzip as _gzip
 from jax._src.lib import xla_client as _xc
+
+def _heap_profile(client):
+  return _gzip.compress(client.heap_profile())
 
 _deprecations = {
     # Finalized 2025-03-25; remove after 2025-06-25
@@ -87,14 +91,14 @@ _deprecations = {
             "jax.lib.xla_client.heap_profile was deprecated in JAX v0.6.0 and"
             " will be removed in JAX v0.7.0"
         ),
-        _xc.heap_profile,
+        _heap_profile,
     ),
     "mlir_api_version": (
         (
             "jax.lib.xla_client.mlir_api_version was deprecated in JAX v0.6.0"
             " and will be removed in JAX v0.7.0"
         ),
-        _xc.mlir_api_version,
+        58,
     ),
     "Client": (
         (
@@ -150,11 +154,9 @@ _deprecations = {
 import typing as _typing
 
 if _typing.TYPE_CHECKING:
-  Shape = _xc.Shape
-  XlaComputation = _xc.XlaComputation
   get_topology_for_devices = _xc.get_topology_for_devices
-  heap_profile = _xc.heap_profile
-  mlir_api_version = _xc.mlir_api_version
+  heap_profile = _heap_profile
+  mlir_api_version = 58
   Client = _xc.Client
   CompileOptions = _xc.CompileOptions
   DeviceAssignment = _xc.DeviceAssignment
@@ -168,4 +170,5 @@ else:
   __getattr__ = _deprecation_getattr(__name__, _deprecations)
   del _deprecation_getattr
 del _typing
+del _heap_profile
 del _xc

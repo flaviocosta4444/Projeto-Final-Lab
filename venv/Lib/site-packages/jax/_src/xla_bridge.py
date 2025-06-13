@@ -31,7 +31,6 @@ import os
 import pkgutil
 import platform as py_platform
 import threading
-import traceback
 from typing import Any, Sequence, Union
 import warnings
 
@@ -43,7 +42,8 @@ from jax._src import util
 from jax._src.cloud_tpu_init import get_tpu_library_path
 from jax._src.lib import cuda_versions
 from jax._src.lib import xla_client
-from jax._src.lib import xla_extension
+from jax._src.lib import _jax
+from jax._src.lib import _profiler
 
 logger = logging.getLogger(__name__)
 
@@ -64,8 +64,6 @@ XlaBackend = xla_client.Client
 FORCE_FORWARD_COMPAT_LOWERING_PLATFORMS: set[str] = set()
 
 MIN_COMPUTE_CAPABILITY = 52
-
-_DEFAULT_CPU_COLLECTIVES_IMPL = 'gloo'
 
 # TODO(phawkins): Remove jax_xla_backend.
 _XLA_BACKEND = config.string_flag(
@@ -128,6 +126,24 @@ _at_fork_handler_installed = False
 
 # Backends
 
+_NameValueMapping = Mapping[str, Union[str, int, list[int], float, bool]]
+
+def make_tpu_client(
+    library_path: str | None = None, options: _NameValueMapping | None = None
+):
+  """Returns a TPU client. Defaults to allowing 32 in-flight computations."""
+  if not _jax.pjrt_plugin_loaded('tpu'):
+    c_api = xla_client.load_pjrt_plugin_dynamically(
+        "tpu", library_path or "libtpu.so"
+    )
+    _profiler.register_plugin_profiler(c_api)
+    assert _jax.pjrt_plugin_loaded('tpu')
+  if not _jax.pjrt_plugin_initialized('tpu'):
+    _jax.initialize_pjrt_plugin('tpu')
+  if options is None:
+    options = {}
+  return _jax.get_c_api_client('tpu', options)
+
 
 def tpu_client_timer_callback(timer_secs: float) -> xla_client.Client | None:
   def _log_warning():
@@ -142,7 +158,7 @@ def tpu_client_timer_callback(timer_secs: float) -> xla_client.Client | None:
   t.start()
 
   try:
-    client = xla_client.make_tpu_client(
+    client = make_tpu_client(
         get_tpu_library_path(),
         _options_from_jax_configs("tpu"))
   finally:
@@ -251,8 +267,6 @@ def make_cpu_client(
                       '"jax_cpu_collectives_implementation", "gloo")` instead.',
                       DeprecationWarning,
                       )
-    if collectives_impl is None:
-      collectives_impl = _DEFAULT_CPU_COLLECTIVES_IMPL
 
     if collectives_impl == 'gloo':
       collectives = xla_client._xla.make_gloo_tcp_collectives(
@@ -296,141 +310,6 @@ def _check_cuda_compute_capability(devices_to_check):
       )
 
 
-def _check_cuda_versions(raise_on_first_error: bool = False,
-                         debug: bool = False):
-  assert cuda_versions is not None
-  results: list[dict[str, Any]] = []
-
-  def _make_msg(name: str,
-                runtime_version: int,
-                build_version: int,
-                min_supported: int,
-                debug_msg: bool = False):
-    if debug_msg:
-      return (f"Package: {name}\n"
-              f"Version JAX was built against: {build_version}\n"
-              f"Minimum supported: {min_supported}\n"
-              f"Installed version: {runtime_version}")
-    if min_supported:
-      req_str = (f"The local installation version must be no lower than "
-                 f"{min_supported}.")
-    else:
-      req_str = ("The local installation must be the same version as "
-                 "the version against which JAX was built.")
-    msg = (f"Outdated {name} installation found.\n"
-           f"Version JAX was built against: {build_version}\n"
-           f"Minimum supported: {min_supported}\n"
-           f"Installed version: {runtime_version}\n"
-           f"{req_str}")
-    return msg
-
-  def _version_check(name: str,
-                     get_version,
-                     get_build_version,
-                     scale_for_comparison: int = 1,
-                     min_supported_version: int = 0):
-    """Checks the runtime CUDA component version against the JAX one.
-
-    Args:
-      name: Of the CUDA component.
-      get_version: A function to get the local runtime version of the component.
-      get_build_version: A function to get the build version of the component.
-      scale_for_comparison: For rounding down a version to ignore patch/minor.
-      min_supported_version: An absolute minimum version required. Must be
-        passed without rounding down.
-
-    Raises:
-      RuntimeError: If the component is not found, or is of unsupported version,
-        and if raising the error is not deferred till later.
-    """
-
-    build_version = get_build_version()
-    try:
-      version = get_version()
-    except Exception as e:
-      err_msg = f"Unable to load {name}. Is it installed?"
-      if raise_on_first_error:
-        raise RuntimeError(err_msg) from e
-      err_msg += f"\n{traceback.format_exc()}"
-      results.append({"name": name, "installed": False, "msg": err_msg})
-      return
-
-    if not min_supported_version:
-      min_supported_version = build_version // scale_for_comparison
-    passed = min_supported_version <= version
-
-    if not passed or debug:
-      msg = _make_msg(name=name,
-                      runtime_version=version,
-                      build_version=build_version,
-                      min_supported=min_supported_version,
-                      debug_msg=passed)
-      if not passed and raise_on_first_error:
-        raise RuntimeError(msg)
-      else:
-        record = {"name": name,
-                  "installed": True,
-                  "msg": msg,
-                  "passed": passed,
-                  "build_version": build_version,
-                  "version": version,
-                  "minimum_supported": min_supported_version}
-        results.append(record)
-
-  _version_check("CUDA", cuda_versions.cuda_runtime_get_version,
-                 cuda_versions.cuda_runtime_build_version,
-                 scale_for_comparison=10,
-                 min_supported_version=12010)
-  _version_check(
-      "cuDNN",
-      cuda_versions.cudnn_get_version,
-      cuda_versions.cudnn_build_version,
-      # NVIDIA promise both backwards and forwards compatibility for cuDNN patch
-      # versions:
-      # https://docs.nvidia.com/deeplearning/cudnn/developer-guide/index.html#api-compat
-      scale_for_comparison=100,
-      min_supported_version=9100
-  )
-  _version_check("cuFFT", cuda_versions.cufft_get_version,
-                 cuda_versions.cufft_build_version,
-                 # Ignore patch versions.
-                 scale_for_comparison=100)
-  _version_check("cuSOLVER", cuda_versions.cusolver_get_version,
-                 cuda_versions.cusolver_build_version,
-                 # Ignore patch versions.
-                 scale_for_comparison=100,
-                 min_supported_version=11400)
-  _version_check("cuPTI", cuda_versions.cupti_get_version,
-                 cuda_versions.cupti_build_version,
-                 min_supported_version=18)
-  _version_check("cuBLAS", cuda_versions.cublas_get_version,
-                 cuda_versions.cublas_build_version,
-                 # Ignore patch versions.
-                 scale_for_comparison=100,
-                 min_supported_version=120100)
-  _version_check("cuSPARSE", cuda_versions.cusparse_get_version,
-                 cuda_versions.cusparse_build_version,
-                 # Ignore patch versions.
-                 scale_for_comparison=100,
-                 min_supported_version=12100)
-
-  errors = []
-  debug_results = []
-  for result in results:
-    message: str = result['msg']
-    if not result['installed'] or not result['passed']:
-      errors.append(message)
-    else:
-      debug_results.append(message)
-
-  join_str = f'\n{"-" * 50}\n'
-  if debug_results:
-    print(f'CUDA components status (debug):\n'
-          f'{join_str.join(debug_results)}')
-  if errors:
-    raise RuntimeError(f'Unable to use CUDA because of the '
-                       f'following issues with CUDA components:\n'
-                       f'{join_str.join(errors)}')
 
 def get_num_nodes_from_gpu_topology(topology: str) -> int:
     try:
@@ -441,12 +320,11 @@ def get_num_nodes_from_gpu_topology(topology: str) -> int:
                        '"<number-of-slices> x <number-of-hosts-per-slice> x '
                        '<number-of-devices-per-host>".')
 
-if hasattr(xla_client, "make_tpu_client"):
-  # TODO(phawkins,skyewm): switch TPU plugin to use the PJRT plugin mechanism,
-  # and then fail loudly on initialization failure.
-  register_backend_factory(
-    'tpu', partial(tpu_client_timer_callback, timer_secs=60.0), priority=300,
-    fail_quietly=True)
+# TODO(phawkins,skyewm): switch TPU plugin to use the PJRT plugin mechanism,
+# and then fail loudly on initialization failure.
+register_backend_factory(
+  'tpu', partial(tpu_client_timer_callback, timer_secs=60.0), priority=300,
+  fail_quietly=True)
 
 
 def _get_pjrt_plugin_names_and_library_paths(
@@ -600,6 +478,8 @@ def _options_from_jax_configs(plugin_name):
 
   return options
 
+OptionsDict = Mapping[str, str | int | list[int] | float | bool]
+
 
 # TODO(b/261345120): decide on a public name and expose a public method which is
 # an alias of this method.
@@ -608,7 +488,7 @@ def register_plugin(
     *,
     priority: int = 400,
     library_path: str | None = None,
-    options: Mapping[str, str | int | list[int] | float | bool] | None = None,
+    options: OptionsDict | Callable[[], OptionsDict] | None = None,
     c_api: Any | None = None,
 ) -> Any:
   """Registers a backend factory for the PJRT plugin.
@@ -619,7 +499,9 @@ def register_plugin(
       Default to be 400.
     library_path: Optional. The full path to the .so file of the plugin. The
       plugin needs to provide either the library_path or the c_api.
-    options: Optional. It is used when creating a PJRT plugin client.
+    options: Optional. It is used when creating a PJRT plugin client. Can be a
+      callable, in which case it will be invoked upon plugin initialization
+      time, and will be expected to return an option dictionary.
     c_api: Optional. The plugin can provide a PJRT C API to be registered.
   """
   def factory():
@@ -627,7 +509,7 @@ def register_plugin(
       xla_client.initialize_pjrt_plugin(plugin_name)
     updated_options = {}
     if options is not None:
-      updated_options.update(options)
+      updated_options.update(options() if callable(options) else options)
     updated_options.update(_options_from_jax_configs(plugin_name))
     if distributed.global_state.client is None:
       return xla_client.make_c_api_client(plugin_name, updated_options, None)
@@ -664,7 +546,7 @@ def register_plugin(
   )
   if library_path is not None:
     c_api = xla_client.load_pjrt_plugin_dynamically(plugin_name, library_path)
-    xla_client.profiler.register_plugin_profiler(c_api)
+    _profiler.register_plugin_profiler(c_api)
   else:
     assert c_api is not None
     xla_client.load_pjrt_plugin_with_c_api(plugin_name, c_api)
@@ -892,7 +774,7 @@ def _suggest_missing_backends():
   assert _default_backend is not None
   default_platform = _default_backend.platform
   if "cuda" not in _backends and hardware_utils.has_visible_nvidia_gpu():
-    if hasattr(xla_extension, "GpuAllocatorConfig") and "cuda" in _backend_errors:
+    if hasattr(_jax, "GpuAllocatorConfig") and "cuda" in _backend_errors:
       err = _backend_errors["cuda"]
       warning_msg = f"CUDA backend failed to initialize: {err}."
       if "no supported devices found for platform CUDA." in err:
@@ -1034,7 +916,7 @@ def devices(
 ) -> list[xla_client.Device]:
   """Returns a list of all devices for a given backend.
 
-  .. currentmodule:: jaxlib.xla_extension
+  .. currentmodule:: jaxlib._jax
 
   Each device is represented by a subclass of :class:`Device` (e.g.
   :class:`CpuDevice`, :class:`GpuDevice`). The length of the returned list is
@@ -1218,7 +1100,7 @@ def make_pjrt_tpu_topology(topology_name='', **kwargs):
           "JAX TPU support not installed; cannot generate TPU topology. See"
           " https://github.com/jax-ml/jax#installation")
     c_api = xla_client.load_pjrt_plugin_dynamically("tpu", library_path)
-    xla_client.profiler.register_plugin_profiler(c_api)
+    _profiler.register_plugin_profiler(c_api)
   assert xla_client.pjrt_plugin_loaded("tpu")
   if not xla_client.pjrt_plugin_initialized("tpu"):
     xla_client.initialize_pjrt_plugin("tpu")

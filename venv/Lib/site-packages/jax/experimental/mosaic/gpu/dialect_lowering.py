@@ -22,7 +22,6 @@ import math
 import operator
 from typing import Any, Sequence, Type, cast
 
-from jax._src import lib as jaxlib
 from jax._src.interpreters import mlir as mlir_interpreter
 from jax._src.lib import mosaic_gpu_dialect as mgpu
 from jax._src.lib.mlir import ir
@@ -38,6 +37,7 @@ from jax._src.lib.mlir.dialects import scf
 from jax._src.lib.mlir.dialects import vector
 from jax._src.util import safe_zip
 from jax.experimental.mosaic.gpu import layouts as layouts_lib
+from jax.experimental.mosaic.gpu import utils as mgpu_utils
 import numpy as np
 
 from . import fragmented_array as fa
@@ -189,17 +189,26 @@ def _initialize_barrier_op_lowering_rule(
 
   for i in range(num_barriers):
     nvvm.mbarrier_init_shared(
-        llvm.getelementptr(ptr_ty, initialize_barrier_op.base_pointer, [], [i],
-                           lowered_barrier_type),
-        utils.c(initialize_barrier_op.arrival_count.value, i32),
-        predicate=ctx.single_thread_per_block_predicate
+        llvm.getelementptr(
+            ptr_ty,
+            initialize_barrier_op.base_pointer,
+            [],
+            [i],
+            lowered_barrier_type,
+            llvm.GEPNoWrapFlags.none,
+        ),
+        utils.c(
+            initialize_barrier_op.arrival_count.value * utils.WARPGROUP_SIZE,
+            i32,
+        ),
+        predicate=ctx.single_thread_per_block_predicate,
     )
 
   gpu.barrier()
 
   barrier_base_ptr = llvm.getelementptr(
       ir.Type.parse("!llvm.ptr"),
-      initialize_barrier_op.base_pointer, [], [0], lowered_barrier_type)
+      initialize_barrier_op.base_pointer, [], [0], lowered_barrier_type, llvm.GEPNoWrapFlags.none)
 
   return utils.ptr_as_memref(
       barrier_base_ptr, initialize_barrier_op.barriers_ref.type),
@@ -391,6 +400,7 @@ def _vector_store_op_lowering_rule(
       vector_store_op.valueToStore, to_store_layout
   )
 
+  mgpu_utils.warpgroup_barrier()  # Make sure the reads have completed.
   if fragmented_array.layout == fa.WGMMA_LAYOUT:
     swizzle, transforms = swizzle_and_transforms_from_transforms_attr(
         inference_utils.in_transforms(vector_store_op)[0]
@@ -400,13 +410,16 @@ def _vector_store_op_lowering_rule(
     fragmented_array.store_tiled(
         reinterpret_smem_ref(vector_store_op.base, transforms), swizzle
     )
-  elif (isinstance(fragmented_array.layout, fa.WGStridedFragLayout) or
+  elif (fragmented_array.layout == fa.WGMMA_ROW_LAYOUT or
+        fragmented_array.layout == fa.WGMMA_COL_LAYOUT or
+        isinstance(fragmented_array.layout, fa.WGStridedFragLayout) or
         isinstance(fragmented_array.layout, fa.WGSplatFragLayout)):
     fragmented_array.store_untiled(vector_store_op.base)
   else:
     raise ValueError(
         f"{vector_store_op} has an unsupported layout: {to_store_layout}"
     )
+  mgpu_utils.warpgroup_barrier()  # Make sure the writes have completed.
 
   return []
 
@@ -459,7 +472,7 @@ def _vector_reduction_op_lowering_rule(
           ir.MemRefType.get([4], element_type, memory_space=smem),
           arith.constant(None, op.attributes["offset"]),
       )
-      result = a.reduce_sum(scratch)
+      result = a.reduce("add", range(len(a.shape)), scratch)
     case (
         "#vector.kind<maxsi>" | "#vector.kind<maxui>" | "#vector.kind<maximumf>"
     ):
@@ -469,14 +482,85 @@ def _vector_reduction_op_lowering_rule(
       raise NotImplementedError(f"Unsupported reduction kind: {op.kind}")
   return [_fragmented_array_to_ir(result, op.result.type)]
 
+@_register_lowering(vector.MultiDimReductionOp)
+def _vector_multi_dim_reduction_op_lowering_rule(
+    ctx: LoweringContext, op: vector.MultiDimReductionOp
+) -> Sequence[ir.Value]:
+  del ctx
 
-# TODO(dasenov): Remove this after the minimal jaxlib version is 0.5.4.
-if jaxlib.version >= (0, 5, 4):
-  @_register_lowering(mgpu.LayoutCastOp)
-  def _mgpu_layout_cast_op_lowering_rule(
-      _: LoweringContext, layout_cast_op: mgpu.LayoutCastOp
+  [in_layout, acc_layout] = inference_utils.in_layouts(op)
+  [out_layout] = inference_utils.out_layouts(op)
+  if layouts.from_layout_attr(in_layout) != fa.WGMMA_LAYOUT:
+    raise NotImplementedError(f"Unsupported input layout: {in_layout}")
+  if layouts.from_layout_attr(out_layout) not in {
+      fa.WGMMA_ROW_LAYOUT,
+      fa.WGMMA_COL_LAYOUT,
+  }:
+    raise NotImplementedError(f"Unsupported output layout: {out_layout}")
+  if out_layout != acc_layout:
+    raise ValueError(
+        f"Output layout {out_layout} must match the accumulator layout"
+        f" {acc_layout}"
+    )
+
+  element_type = ir.VectorType(op.source.type).element_type
+
+  is_signed = False if ir.IntegerType.isinstance(element_type) else None
+  source_fa = _fragmented_array_from_ir(op.source, in_layout, is_signed)
+  acc_fa = _fragmented_array_from_ir(op.acc, acc_layout, is_signed)
+  match vector.CombiningKind[
+      str(op.kind).removeprefix("#vector.kind<").removesuffix(">").upper()
+  ]:
+    case vector.CombiningKind.ADD:
+      result = source_fa.reduce("add", op.reduction_dims[0])
+      result += acc_fa
+    case (
+        vector.CombiningKind.MAXIMUMF
+        | vector.CombiningKind.MAXSI
+        | vector.CombiningKind.MAXUI
+    ):
+      result = source_fa.reduce("max", op.reduction_dims[0])
+      result = result.max(acc_fa)
+    case _:
+      raise NotImplementedError(f"Unsupported reduction kind: {op.kind}")
+  return [_fragmented_array_to_ir(result, op.result.type)]
+
+
+@_register_lowering(mgpu.LayoutCastOp)
+def _mgpu_layout_cast_op_lowering_rule(
+    _: LoweringContext, layout_cast_op: mgpu.LayoutCastOp
+) -> Sequence[ir.Value]:
+  return [layout_cast_op.x]
+
+
+# TODO(dasenov): Remove this after the minimal jaxlib version is 0.6.1.
+if hasattr(mgpu, "BroadcastInDimOp"):
+  @_register_lowering(mgpu.BroadcastInDimOp)
+  def _mgpu_broadcast_in_dim_op_lowering_rule(
+      _: LoweringContext, op: mgpu.BroadcastInDimOp
   ) -> Sequence[ir.Value]:
-    return [layout_cast_op.x]
+    in_ty = ir.VectorType(op.operand.type)
+    out_ty = ir.VectorType(op.result.type)
+    if len(in_ty.shape) != 1 or len(out_ty.shape) != 2:
+      raise NotImplementedError(
+          "Broadcast in dim with non-trivial broadcast dimensions is not"
+          f" supported: {op}"
+      )
+
+    broadcast_dims = list(op.broadcast_dimensions)
+    in_layout = inference_utils.in_layouts(op)[0]
+    operand_fa = _fragmented_array_from_ir(op.operand, in_layout)
+
+    if (operand_fa.layout == fa.WGMMA_ROW_LAYOUT and broadcast_dims == [0]):
+      out = operand_fa.broadcast_minor(out_ty.shape[1])
+    elif (operand_fa.layout == fa.WGMMA_COL_LAYOUT and broadcast_dims == [1]):
+      out = operand_fa.broadcast_major(out_ty.shape[0])
+    else:
+      raise NotImplementedError(
+          "Broadcast in dim with non-trivial broadcast dimensions is not"
+          f" supported: {op}"
+      )
+    return [_fragmented_array_to_ir(out, out_ty)]
 
 
 def swizzle_and_transforms_from_transforms_attr(
@@ -599,7 +683,7 @@ def _mgpu_async_load_op_lowering_rule(
     ctx: LoweringContext, load_op: mgpu.AsyncLoadOp
 ) -> Sequence[ir.Value]:
   assert ctx.launch_context is not None
-  barrier = utils.BarrierRef.from_dialect_barrier_memref(load_op.barrier)
+  barrier = utils.DialectBarrierRef.from_barrier_memref(load_op.barrier)
 
   if inference_utils.has_in_transforms_set(load_op):
     [transforms] = inference_utils.in_transforms(load_op)
@@ -627,9 +711,8 @@ def _mgpu_async_load_op_lowering_rule(
       src_ref=load_op.source,
       dst_ref=reinterpret_smem_ref(load_op.destination, transforms),
       gmem_slice=tuple(gmem_slice),
-      barrier=barrier,
+      barrier=barrier.barrier_ref,
       arrive=False,
-      uniform=True,
       swizzle=swizzle,
       gmem_transform=transforms,
       predicate=ctx.single_thread_per_warpgroup_predicate,
@@ -671,7 +754,6 @@ def _mgpu_async_store_op_lowering_rule(
       gmem_slice=tuple(gmem_slice),
       swizzle=swizzle,
       gmem_transform=transforms,
-      uniform=True,
       predicate=ctx.single_thread_per_warpgroup_predicate,
       arrive=store_op.commit_group,
   )
@@ -927,14 +1009,25 @@ def _mgpu_wgmma_op_lowering_rule(
 
 @_register_lowering(mgpu.ArriveExpectTxOp)
 def _mgpu_arrive_expect_tx_op_lowering_rule(
-    ctx: LoweringContext, arrive_expect_tx_op: mgpu.ArriveExpectTxOp
+    _: LoweringContext, arrive_expect_tx_op: mgpu.ArriveExpectTxOp
 ) -> Sequence[ir.Value]:
+  bytes = arrive_expect_tx_op.expect_tx.value
+  if bytes % utils.WARPGROUP_SIZE:
+    raise NotImplementedError(
+        "Only copies of a multiple of 128 bytes are supported"
+    )
+  # We arrive uniformly from each thread in the WG, so we need to divide the
+  # number of bytes by the number of threads in the WG.
+  # TODO: dasenov - Relax this. We can just select the WG leader and have it
+  # arrive with the whole transfer size, while everyone else arrives with 0.
+  # But we should continue using this scheme as it's likely to be faster.
+  bytes //= utils.WARPGROUP_SIZE
+  bytes = utils.c(bytes, ir.IntegerType.get_signless(32))
 
-  barrier = utils.BarrierRef.from_dialect_barrier_memref(arrive_expect_tx_op.barrier)
-  barrier.arrive_expect_tx(
-      arrive_expect_tx_op.expect_tx.value,
-      ctx.single_thread_per_warpgroup_predicate,
+  barrier = utils.DialectBarrierRef.from_barrier_memref(
+      arrive_expect_tx_op.barrier
   )
+  nvvm.mbarrier_arrive_expect_tx_shared(barrier.get_ptr(), bytes)
 
   return []
 
@@ -944,7 +1037,7 @@ def _mgpu_wait_op_lowering_rule(
     _: LoweringContext, wait_op: mgpu.WaitOp
 ) -> Sequence[ir.Value]:
 
-  barrier = utils.BarrierRef.from_dialect_barrier_memref(wait_op.barrier)
+  barrier = utils.DialectBarrierRef.from_barrier_memref(wait_op.barrier)
   barrier.wait_parity(wait_op.parity)
 
   return []
@@ -1028,6 +1121,54 @@ def _unflatten_ir_values(
   return result
 
 
+def _move_scf_block_to_block_with_flattened_arguments(
+    ctx: LoweringContext,
+    old_block: ir.Block,
+    new_block: ir.Block,
+    last_op_type: type[ir.OpView],
+    args_template: Sequence[_VectorTemplate | None],
+    *new_leading_args: Sequence[ir.Value],
+) -> Sequence[_VectorTemplate | None]:
+  """Moves the operations from `old_block` to `new_block`.
+
+  The input arguments to the block, if any, are flattened using the provided
+  `args_template`, except for any new_leading_args which are simply prepended
+  to the flattened arguments and must be part of the template.
+
+  The last operation of the old block must be of type `last_op_type` which
+  is expected to be either a `scf.YieldOp` or a `scf.ConditionOp`. This
+  operation is recreated with flattened output arguments.
+  """
+  out_template = None
+  with ir.InsertionPoint(new_block):
+    new_carry = _unflatten_ir_values(new_block.arguments[len(new_leading_args):], args_template)
+    new_args = new_leading_args + tuple(new_carry)
+    for old_arg, new_arg in zip(old_block.arguments, new_args, strict=True):
+      old_arg.replace_all_uses_with(new_arg)
+    for op in [*old_block]:
+      if not isinstance(op, last_op_type):
+        mgpu.private_operation_remove_from_parent(op)
+        mgpu.private_block_append_owned_operation(new_block, op)
+        ctx.lower_op(op)
+      else:
+        assert out_template is None
+        layouts = (
+            inference_utils.in_layouts(op)
+            if inference_utils.has_in_layouts_set(op)
+            else []
+        )
+        if isinstance(op, scf.YieldOp):
+          flat_operands, out_template = _flatten_ir_values(op.operands, layouts)
+          scf.yield_(flat_operands)
+        elif isinstance(op, scf.ConditionOp):
+          flat_carry, out_template = _flatten_ir_values(op.args, layouts)
+          scf.condition(op.condition, flat_carry)
+        else:
+          raise NotImplementedError(f"Unsupported op type: {op}")
+        op.erase()
+  assert out_template is not None
+  return out_template
+
 @_register_lowering(scf.ForOp)
 def _for_op_lowering_rule(
     ctx: LoweringContext, for_op: scf.ForOp
@@ -1050,31 +1191,76 @@ def _for_op_lowering_rule(
       for_op.step,
       flat_init_args,
   )
-  with ir.InsertionPoint(new_for_op.body):
-    recreated_carry = _unflatten_ir_values(
-        new_for_op.body.arguments[1:], args_template
-    )
-    ops_to_lower = []
-    for op in [*for_op.body]:
-      if op == yield_op:
-        continue
-      mgpu.private_operation_remove_from_parent(op)
-      mgpu.private_block_append_owned_operation(new_for_op.body, op)
-      ops_to_lower.append(op)
-    new_args = (new_for_op.induction_variable, *recreated_carry)
-    for old_carry, new_carry in zip(for_op.body.arguments, new_args, strict=True):
-      old_carry.replace_all_uses_with(new_carry)
 
-  for op in ops_to_lower:
-    with ir.InsertionPoint(op):
-      ctx.lower_op(op)
-
-  with ir.InsertionPoint(new_for_op.body):
-    flat_operands, _ = _flatten_ir_values(yield_op.operands, in_layouts)
-    yield_op.erase()
-    scf.yield_(flat_operands)
+  _move_scf_block_to_block_with_flattened_arguments(
+      ctx,
+      for_op.body,
+      new_for_op.body,
+      scf.YieldOp,
+      args_template,
+      new_for_op.induction_variable,
+  )
 
   return _unflatten_ir_values(new_for_op.results, args_template)
+
+
+@_register_lowering(scf.WhileOp)
+def _while_op_lowering_rule(
+    ctx: LoweringContext, while_op: scf.WhileOp
+) -> MlirLoweringRuleResult:
+  if not inference_utils.should_have_layout(while_op):
+    return _traverse_op_lowering_rule(ctx, while_op)
+
+  before_block = while_op.before.blocks[0]
+  after_block = while_op.after.blocks[0]
+  condition_op = before_block.operations[len(before_block.operations) - 1]
+  yield_op = after_block.operations[len(after_block.operations) - 1]
+
+  in_layouts = inference_utils.in_layouts(while_op)
+  out_layouts = inference_utils.out_layouts(while_op)
+
+  if in_layouts:
+    yield_layouts = inference_utils.in_layouts(yield_op)
+    if in_layouts != yield_layouts:
+      raise ValueError(
+          f"Input layouts {in_layouts} do not match yield layouts"
+          f" {yield_layouts}"
+      )
+
+  if out_layouts:
+    condition_layouts = inference_utils.in_layouts(condition_op)
+    if out_layouts != condition_layouts:
+      raise ValueError(
+          f"Output layouts {out_layouts} do not match condition layouts"
+          f" {condition_layouts}"
+      )
+
+  flat_inits, inits_template = _flatten_ir_values(while_op.inits, in_layouts)
+  result_types = _infer_flat_result_types(while_op, out_layouts)
+  new_while_op = scf.WhileOp(result_types, flat_inits)
+
+  # Before block
+  init_types = [v.type for v in flat_inits]
+  new_before_block = new_while_op.before.blocks.append(*init_types)
+  results_template = _move_scf_block_to_block_with_flattened_arguments(
+      ctx,
+      before_block,
+      new_before_block,
+      scf.ConditionOp,
+      inits_template,
+  )
+
+  # After block
+  new_after_block = new_while_op.after.blocks.append(*result_types)
+  _move_scf_block_to_block_with_flattened_arguments(
+      ctx,
+      after_block,
+      new_after_block,
+      scf.YieldOp,
+      results_template,
+  )
+
+  return _unflatten_ir_values(new_while_op.results, results_template)
 
 
 def _infer_flat_result_types(
@@ -1126,19 +1312,9 @@ def _index_switch_op_lowering_rule(
   ):
     [block] = region.blocks
     new_block = new_region.blocks.append()
-    with ir.InsertionPoint(new_block):
-      for op in [*block]:
-        if not isinstance(op, scf.YieldOp):
-          mgpu.private_operation_remove_from_parent(op)
-          mgpu.private_block_append_owned_operation(new_block, op)
-          ctx.lower_op(op)
-          continue
-        if inference_utils.in_layouts(op) != out_layouts:
-          raise ValueError("Layout mismatch")
-        flat_results, results_template = _flatten_ir_values(
-            op.operands, out_layouts
-        )
-        scf.yield_(flat_results)
+    results_template = _move_scf_block_to_block_with_flattened_arguments(
+        ctx, block, new_block, scf.YieldOp, []
+    )
   return _unflatten_ir_values(new_switch_op.results, results_template)
 
 

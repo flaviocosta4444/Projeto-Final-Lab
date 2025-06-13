@@ -13,42 +13,48 @@
 # limitations under the License.
 """Pallas helper functions."""
 
-from typing import Any, Protocol
-
 import jax
-import jax.numpy as jnp
 from jax._src.pallas import pallas_call
 from jax._src.pallas import core as pl_core
 
 
 @jax.named_call
 def empty(
-    shape: tuple[int, ...], dtype: jnp.dtype, *, memory_space: Any = None
+    shape: tuple[int, ...],
+    dtype: jax.typing.DTypeLike,
+    *,
+    memory_space: object | None = None,
+    interpret: bool = False,
+    backend: pl_core.Backend | None = None,
 ):
-  def _empty_kernel(_):
-    # No-op to leave the out_ref uninitialized
-    pass
+  return empty_like(
+      jax.ShapeDtypeStruct(shape, dtype),
+      memory_space=memory_space,
+      interpret=interpret,
+      backend=backend,
+  )
 
+
+@jax.named_call
+def empty_like(
+    x: object,
+    *,
+    memory_space: object | None = None,
+    interpret: bool = False,
+    backend: pl_core.Backend | None = None,
+):
   if memory_space is None:
-    kernel_memory_space = pl_core.MemorySpace.ANY
-    memory_space = jax.ShapeDtypeStruct
-  else:
-    kernel_memory_space = memory_space
+    memory_space = pl_core.MemorySpace.ANY
   return pallas_call.pallas_call(
-      _empty_kernel,
-      in_specs=[],
-      out_specs=pl_core.BlockSpec(memory_space=kernel_memory_space),
-      out_shape=memory_space(shape, dtype),
+      # No-op to leave the out_ref uninitialized
+      lambda *_: None,
+      out_specs=jax.tree.map(
+          lambda _: pl_core.BlockSpec(memory_space=memory_space), x
+      ),
+      out_shape=x,
+      interpret=interpret,
+      backend=backend,
   )()
-
-
-class ArrayLike(Protocol):
-  shape: tuple[int, ...]
-  dtype: jnp.dtype
-
-
-def empty_like(x: ArrayLike, *, memory_space: Any = None):
-  return empty(x.shape, x.dtype, memory_space=memory_space)
 
 
 def when(condition):

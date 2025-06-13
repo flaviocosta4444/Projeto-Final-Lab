@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+from typing import Protocol, TypeVar
 from collections.abc import Callable, Sequence
 import dataclasses
 import functools
@@ -39,7 +40,22 @@ import jax.numpy as jnp
 
 map = util.safe_map
 zip = util.safe_zip
+T = TypeVar('T')
 
+def _get_block_size(
+    bd: pl.Blocked | pl.Element | pl.Squeezed | pl.BoundedSlice | int | None,
+) -> int:
+  match bd:
+    case int():
+      return bd
+    case pl.Blocked(block_size):
+      return block_size
+    case _:
+      raise NotImplementedError(f"Unsupported block size type: {type(bd)}")
+
+def _get_block_shape(spec: pallas_core.BlockSpec):
+  assert spec.block_shape is not None
+  return tuple(_get_block_size(bd) for bd in spec.block_shape)
 
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True)
@@ -64,10 +80,11 @@ class BufferedRef:
     # We don't allow Python scalars here, because they are interpreted
     # differently depending on the x32/x64 mode.
     assert all(i.dtype == jnp.dtype(jnp.int32) for i in grid_indices)
+    sizes = _get_block_shape(self.spec)
     return tuple(
         pl.Slice(idx * size, size)  # type: ignore[arg-type]
         for idx, size in zip(
-            index_map(*grid_indices), self.spec.block_shape  # type: ignore[arg-type]
+            index_map(*grid_indices), sizes  # type: ignore[arg-type]
         )
     )
 
@@ -201,7 +218,7 @@ def emit_pipeline(
     in_smem_refs, out_smem_refs = util.split_list(
         [
             gpu_core.SMEM(
-                (max_concurrent_steps, *spec.block_shape),  # type: ignore
+                (max_concurrent_steps, *_get_block_shape(spec)),  # type: ignore
                 ref.dtype,
                 transforms=tuple(
                     t.batch(1) for t in getattr(spec, "transforms", ())
@@ -213,6 +230,7 @@ def emit_pipeline(
         ],
         [len(in_specs)],
     )
+    arrival_count = sum(map(_in_smem, in_specs))
     return pl.run_scoped(
         functools.partial(
             scoped_pipeline,
@@ -221,9 +239,11 @@ def emit_pipeline(
         ),
         in_smem_refs=in_smem_refs,
         out_smem_refs=out_smem_refs,
-        barrier_ref=gpu_core.Barrier(
+        barrier_ref=None
+        if arrival_count == 0
+        else gpu_core.Barrier(
             # TODO(slebedev): Change this to arrive only once.
-            sum(map(_in_smem, in_specs)),
+            arrival_count,
             num_barriers=max_concurrent_steps,
         ),
     )
@@ -260,8 +280,8 @@ def emit_pipeline(
       slot = lax.rem(step, max_concurrent_steps)
       indices, fetch_indices, last_store_slices = carry
 
-      if in_specs:
-        # Wait for the current GMEM->SMEM copy to complete.
+      if barrier_ref is not None:
+        # Wait for the current GMEM->SMEM copy to complete, if any.
         gpu_primitives.barrier_wait(barrier_ref.at[slot])
       # Wait for the previous output SMEM->GMEM copy to complete.
       if copies_out_in_loop:
@@ -306,7 +326,8 @@ def emit_pipeline(
             predicate=lax.bitwise_or(slices_changed, is_last_step),
         )
 
-      gpu_primitives.commit_smem_to_gmem_group()
+      if copies_out_in_loop:
+        gpu_primitives.commit_smem_to_gmem_group()
 
       fetch_step = step + (max_concurrent_steps - delay_release)
       fetch_slot = lax.rem(fetch_step, max_concurrent_steps)
@@ -347,6 +368,7 @@ def emit_pipeline(
     # loop. This is the only place where we store them.
     if not copies_out_in_loop:
       gpu_primitives.commit_smem()
+
     last_slot = lax.rem(num_steps - 1, max_concurrent_steps)
     for bref in out_brefs:
       if bref.is_index_invariant:
@@ -360,6 +382,34 @@ def emit_pipeline(
   return pipeline
 
 
+class ComputeContext(Protocol):
+  """Protocol for a compute context for the warp specialized pipeline.
+
+  The ComputeContext is run exclusively in the compute thread and allows
+  the user to set up a prologue to initialize a pipeline carry and an epilogue
+  to consume the final carry.
+
+  All values allocated in the ComputeContext will only be allocated in the
+  compute thread and not the memory thread. This can potentially reduce
+  register pressure if certain values are only consumed by the compute threads.
+
+  Usage will usually follow this structure:
+
+  ```
+  def compute_context(pipeline):
+    # Perform prologue work and compute the initial carry.
+    initial_carry = ...
+    # Run the pipeline.
+    final_carry = pipeline(*initial_carry)
+    # Perform epilogue work using the final carry.
+    do_work(final_carry)
+  ```
+
+  """
+  def __call__(self, pipeline: Callable[[T], T]) -> None:
+    ...
+
+
 def emit_pipeline_warp_specialized(
     body: Callable[..., None],
     *,
@@ -371,7 +421,7 @@ def emit_pipeline_warp_specialized(
     wg_axis: str,
     num_compute_wgs: int,
     manual_consumed_barriers: bool = False,
-    carry_coroutine: Any | None = None,
+    compute_context: ComputeContext | None = None,
     memory_thread_idx: int | None = None,
 ):
   """Creates a function to emit a warp-specialized pipeline.
@@ -384,7 +434,7 @@ def emit_pipeline_warp_specialized(
   def body(indices, *input_refs, *output_refs, [consumed_barriers]) -> None:
   ```
 
-  or with a carries enabled (enabled via the ``carry_coroutine`` argument),
+  or with a carries enabled (enabled via the ``compute_context`` argument),
   where the body returns the next carry:
 
   ```
@@ -407,11 +457,15 @@ def emit_pipeline_warp_specialized(
     manual_consumed_barriers: If True, consumed barriers will be
       passed into the body function after the output refs. There will be one
       barrier per input and will be passed in the same order.
-    carry_coroutine: If specified, enables carries in the pipeline.
-      The signature of the body function will be modified such that the last
-      argument will be the current carry and it must return the next carry.
-      The coroutine itself should yield the initial carry, and the
-      yield statement will return the final value of the carry.
+    compute_context: If specified, enables carries in the pipeline and allows
+      a user-specified prologue/epilogue that is only executed in the compute
+      thread. The signature of the pipeline body function will be modified
+      such that the last argument will be the current carry and it must
+      return the next carry.
+      The compute_context itself should follow the signature of `ComputeContext`
+      and take a pipeline function as its sole argument. Calling the
+      pipeline with the initial carry will run the pipeline and return the
+      final carry.
     memory_thread_idx: The index of the memory thread. If not specified,
       defaults to the last thread.
   """
@@ -425,7 +479,7 @@ def emit_pipeline_warp_specialized(
     # thread is the last thread.
     raise NotImplementedError("Memory thread must be the last thread.")
 
-  has_carry = carry_coroutine is not None
+  has_carry = compute_context is not None
 
   # Trace the index maps to determine if they depend on the grid.
   # Grid-independent values will not be multiple-buffered.
@@ -506,6 +560,7 @@ def emit_pipeline_warp_specialized(
         out_smem_refs=out_smem_refs,
         in_smem_barrier_refs=in_smem_barriers,
         consumed_barrier_refs=consumed_barriers,
+        collective_axes=wg_axis,
     )
 
   def scoped_pipeline(
@@ -604,25 +659,27 @@ def emit_pipeline_warp_specialized(
       ]
 
       if has_carry:
-        _carry = carry_coroutine()
-        try:
-          carry_init = next(_carry)
-        except StopIteration:
-          raise ValueError("carry_coroutine must yield the initial carry.")  # pylint: disable=raise-missing-from
+        last_indices = None
+        def pipeline_callback(user_init_carry):
+          nonlocal last_indices
+          if last_indices is not None:
+            raise ValueError(
+              "Cannot call pipeline more than once in `compute_context`")
+          init_loop_carry = (init_indices, last_store_slices, user_init_carry)
+          last_indices, _, final_body_carry = lax.fori_loop(0,
+                        num_steps,
+                        compute_loop_body,
+                        init_loop_carry)
+          return final_body_carry
+        compute_context(pipeline_callback)
+        if last_indices is None:
+          raise ValueError("Pipeline was not called in `compute_context`")
       else:
-        _carry = None
-        carry_init = None
-      init_loop_carry = (init_indices, last_store_slices, carry_init)
-      last_indices, _, final_body_carry = lax.fori_loop(0,
-                    num_steps,
-                    compute_loop_body,
-                    init_loop_carry)
-      if has_carry:
-        try:
-          _carry.send(final_body_carry)  # pytype: disable=attribute-error
-          raise ValueError("carry_coroutine must only yield once.")
-        except StopIteration:
-          pass
+        assert compute_context is None
+        last_indices, _, _ = lax.fori_loop(
+            0, num_steps, compute_loop_body,
+            (init_indices, last_store_slices, None)
+        )
 
       # Handle index_invariant outputs after the loop. They are not
       # written in the main pipeline loop.

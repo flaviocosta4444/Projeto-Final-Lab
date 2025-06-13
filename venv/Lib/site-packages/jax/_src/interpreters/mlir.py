@@ -16,11 +16,12 @@
 from __future__ import annotations
 
 import collections
-import contextlib
 from collections.abc import Callable, Iterable, Iterator, Sequence
+import contextlib
 import dataclasses
 import functools
 from functools import partial
+import heapq
 import io
 import itertools
 import operator
@@ -31,14 +32,13 @@ import typing
 from typing import Any, NamedTuple, Protocol, Union, cast as type_cast
 import warnings
 
-import numpy as np
-
 from jax._src import ad_util
 from jax._src import api_util
 from jax._src import config
 from jax._src import core
 from jax._src import dtypes
 from jax._src import effects as effects_lib
+from jax._src import jaxpr_util
 from jax._src import linear_util as lu
 from jax._src import path
 from jax._src import sharding_impls
@@ -48,18 +48,20 @@ from jax._src import xla_bridge as xb
 from jax._src.interpreters import partial_eval as pe
 from jax._src.interpreters import xla
 from jax._src.layout import AutoLayout, DeviceLocalLayout
+from jax._src.lib import _jax
+from jax._src.lib import xla_client as xc
+from jax._src.lib.mlir import dialects, ir, passmanager
+from jax._src.lib.mlir import register_jax_dialects
+from jax._src.lib.mlir.dialects import func as func_dialect, hlo
+from jax._src.mesh import AxisType
 from jax._src.partition_spec import PartitionSpec
 from jax._src.sharding import Sharding as JSharding
-from jax._src.sharding_impls import (AUTO, NamedSharding,
-                                     modify_sdy_sharding_wrt_axis_types,
-                                     SdyArraySharding, SdyArrayShardingList)
-from jax._src.util import foreach
-from jax._src.lib import xla_client as xc
-from jax._src.lib import xla_extension
-from jax._src.lib.mlir import dialects, ir, passmanager
-from jax._src.lib.mlir.dialects import func as func_dialect, hlo
-from jax._src.lib.mlir import register_jax_dialects
+from jax._src.sharding_impls import ( AUTO, NamedSharding,
+                                     SdyArray, SdyArrayList,
+                                     modify_sdy_sharding_wrt_axis_types)
 from jax._src.state.types import AbstractRef
+from jax._src.util import foreach
+import numpy as np
 
 # mypy: ignore-errors
 
@@ -584,11 +586,7 @@ def module_to_bytecode(module: ir.Module) -> bytes:
 
 # Create one global thread pool that can be shared between multiple ir.Contexts
 # and enabling multi-threading
-# TODO: remove this check after jaxlib 0.5.4
-if hasattr(ir, "ThreadPool"):
-  global_thread_pool = ir.ThreadPool()
-else:
-  global_thread_pool = None
+global_thread_pool = ir.ThreadPool()
 
 
 class JaxIrContext(ir.Context):
@@ -605,16 +603,7 @@ def make_ir_context() -> ir.Context:
   context.append_dialect_registry(upstream_dialects)
   context.load_all_available_dialects()
 
-  # TODO: remove this check after v0.5.4 jaxlib
-  if global_thread_pool is not None:
-    context.set_thread_pool(global_thread_pool)
-  else:
-    # If threading is enabled, each MLIR context will keep alive a thread pool.
-    # Since we cache MLIR modules (and hence contexts), this means we might keep
-    # several threads alive for each cache entry. This is a terrible idea. However
-    # we don't do any heavy computation on MLIR modules from Python anyway, so we
-    # just disable threading.
-    context.enable_multithreading(False)
+  context.set_thread_pool(global_thread_pool)
   dialects.sdy.register_dialect(context)
   dialects.mhlo.register_mhlo_dialect(context)
   dialects.chlo.register_dialect(context)
@@ -1017,24 +1006,35 @@ _platforms_with_donation = ["cpu", "cuda", "rocm", "tpu", "neuron"]
 
 
 def add_manual_axes(axis_ctx: sharding_impls.SPMDAxisContext, sharding, ndim):
-  mesh = axis_ctx.mesh
+  mesh = axis_ctx.mesh.abstract_mesh
+  sharding_mesh = sharding.mesh.abstract_mesh
   if (isinstance(sharding, sharding_impls.NamedSharding) and
-      sharding.mesh.shape == mesh.shape):
-    return sharding_impls.NamedSharding(
-        sharding.mesh, sharding.spec, memory_kind=sharding.memory_kind,
-        _manual_axes=axis_ctx.manual_axes)
+      sharding_mesh.shape == mesh.shape):
+    out_mesh, spec = sharding_mesh, sharding.spec
   else:
-    spec = sharding_impls.parse_flatten_op_sharding(
+    out_mesh, spec = mesh, sharding_impls.parse_flatten_op_sharding(
         sharding._to_xla_hlo_sharding(ndim), mesh)[0]
-    return sharding_impls.NamedSharding(
-      mesh, spec, memory_kind=sharding.memory_kind,
-      _manual_axes=axis_ctx.manual_axes)
+
+  out_mesh = out_mesh.update_axis_types(
+      {a: AxisType.Manual for a in axis_ctx.manual_axes})
+  out = sharding_impls.NamedSharding(out_mesh, spec,
+                                     memory_kind=sharding.memory_kind)
+  manual_axes = out.mesh.manual_axes
+  if any(p in manual_axes for s in out.spec
+         if s is not None and s is not PartitionSpec.UNCONSTRAINED
+         for p in (s if isinstance(s, tuple) else (s,))):
+    raise ValueError(
+        f'pspec {out.spec} contains a manual axes {manual_axes} of mesh'
+        f' which is not allowed. If you are using a'
+        ' with_sharding_constraint under a shard_map, only use the'
+        ' mesh axis in PartitionSpec which are not manual.')
+  return out
 
 
 def _to_physical_op_sharding(
     ctx: ModuleContext,
     aval: core.AbstractValue, sharding: JSharding | AUTO | None,
-) -> xc.OpSharding | SdyArraySharding | None:
+) -> xc.OpSharding | SdyArray | None:
   if sharding is None:
     return None
   if all_unconstrained(sharding, aval):
@@ -1098,11 +1098,56 @@ class UnconstrainedVariants(NamedTuple):
 
 def _get_unconstrained_variants(s, aval) -> UnconstrainedVariants:
   us = contains_unconstrained(s)
-  unconstrained_dims = ({i for i, p in enumerate(s.spec)
+  unconstrained_dims = ({i for i, p in enumerate(s.spec)  # pytype: disable=attribute-error
                          if p is PartitionSpec.UNCONSTRAINED} if us else None)
   return UnconstrainedVariants(
       contains_unconstrained=us, all_unconstrained=all_unconstrained(s, aval),
       unconstrained_dims=unconstrained_dims)
+
+
+def check_jaxpr_constants(closed_jaxpr: core.ClosedJaxpr):
+  """Check if a JAXPR contains an excessive amount of constants, if so, report where they were captured"""
+  if (threshold := config.captured_constants_warn_bytes.value) == -1:
+    return
+
+  # need the unaesthetic getter here as some of the consts in the test suite are arbitrary objects
+  total_iter, nbytes_iter = itertools.tee(
+      map(lambda c: getattr(c, "nbytes", 0), closed_jaxpr.consts)
+  )
+
+  if (total_bytes := sum(total_iter)) < threshold:
+    return
+
+  message = (
+      "A large amount of constants were captured during lowering"
+      f" ({util.pprint_bytes(total_bytes)} total). If this is intentional,"
+      " disable this warning by setting JAX_CAPTURED_CONSTANTS_WARN_BYTES=-1. "
+  )
+
+  if not (num_frames := config.captured_constants_report_frames.value):
+    message += (
+        "To obtain a report of where these constants were encountered, "
+        "set JAX_CAPTURED_CONSTANTS_REPORT_FRAMES=-1."
+    )
+    warnings.warn(message)
+    return
+
+  message += (
+      "The subsequent report may be disabled by setting JAX_CAPTURED_CONSTANTS_REPORT_FRAMES=0.\n\n"
+      f"Largest {min(num_frames, len(closed_jaxpr.consts))} allocation(s):\n"
+  )
+  try:
+    nbytes_var_const = zip(nbytes_iter, closed_jaxpr.jaxpr.constvars, closed_jaxpr.consts)
+    for nbytes, var, const in heapq.nlargest(5, nbytes_var_const, key=operator.itemgetter(0)):
+      message += f"  Constant {type(const)}, {var.aval.str_short()}, {util.pprint_bytes(nbytes)} captured at:\n"
+
+      for eqn in jaxpr_util.eqns_using_var(closed_jaxpr.jaxpr, var):
+        call_frame_source_info = source_info_util.summarize(eqn.source_info, num_frames)
+        message += "  " * 2 + call_frame_source_info.replace("\n", "\n" + "  " * 2) + "\n\n"
+
+    warnings.warn(message)
+  except Exception as exc:
+    warnings.warn(message + f" Exception raised while generating report: {exc}")
 
 
 def lower_jaxpr_to_module(
@@ -1442,6 +1487,8 @@ def lower_jaxpr_to_fun(
     MLIR func op
   """
   util.test_event("lower_jaxpr_to_fun", name)
+  check_jaxpr_constants(jaxpr)
+
   # The first dimension variable may be the platform index
   num_dim_vars = len(ctx.shape_poly_state.dim_vars)
   dim_var_avals = [core.ShapedArray((), dtypes.canonicalize_dtype(np.int64))] * num_dim_vars
@@ -1792,10 +1839,10 @@ def replicate_trailing_dims(ctx, val: ir.Value, aval) -> ir.Value:
   assert isinstance(aval, (core.ShapedArray, core.DShapedArray))
   if config.use_shardy_partitioner.value:
     physical_ndim = core.physical_aval(aval).ndim
-    s = SdyArraySharding(
+    s = SdyArray(
         mesh_shape=None,
-        dimension_shardings=[
-            sharding_impls.SdyDimSharding(axes=[], is_open=i < aval.ndim)
+        dim_shardings=[
+            sharding_impls.SdyDim(axes=[], is_open=i < aval.ndim)
             for i in range(physical_ndim)
         ])
     return wrap_with_sharding_op(ctx, val, aval, s)
@@ -2033,6 +2080,11 @@ def _platforms_for_eqn_ctx(eqn_ctx: core.JaxprEqnContext | None
     return ('tpu',)
   return ()
 
+def _platforms_for_eqn(ctx: LoweringRuleContext) -> tuple[str, ...]:
+  """The lowering platforms for the current eqn"""
+  return tuple((_platforms_for_eqn_ctx(ctx.jaxpr_eqn_ctx) or
+               ctx.platforms or ctx.module_context.platforms))
+
 
 def lower_per_platform(ctx: LoweringRuleContext,
                        description: str,
@@ -2075,8 +2127,7 @@ def lower_per_platform(ctx: LoweringRuleContext,
    rule_args: the args of the lowering rules.
    rule_kwargs: the kwargs of the lowering rules.
   """
-  platforms: Sequence[str] = (_platforms_for_eqn_ctx(ctx.jaxpr_eqn_ctx) or
-                              ctx.platforms or ctx.module_context.platforms)
+  platforms: Sequence[str] = _platforms_for_eqn(ctx)
   # Special case the common case (single-platform lowering)
   if len(platforms) == 1:
     rule = platform_rules.get(platforms[0], default_rule)
@@ -2242,10 +2293,17 @@ def _lower_jaxpr_to_fun_cached(ctx, fn_name, call_jaxpr, effects, name_stack,
     try:
       func_op = ctx.cached_primitive_lowerings[key]
     except KeyError:
+      num_callbacks = len(ctx.host_callbacks)
       func_op = lower_jaxpr_to_fun(
           ctx, fn_name, call_jaxpr, effects, name_stack, arg_names=arg_names,
           result_names=result_names)
-      ctx.cached_primitive_lowerings[key] = func_op
+
+      # If this Jaxpr includes callbacks, we can't cache the lowering because
+      # on TPU every callback must have a globally unique channel, but the
+      # channel gets assigned during lowering.
+      has_callbacks = len(ctx.host_callbacks) > num_callbacks
+      if not has_callbacks or "tpu" not in ctx.platforms:
+        ctx.cached_primitive_lowerings[key] = func_op
   else:
     func_op = lower_jaxpr_to_fun(
         ctx, fn_name, call_jaxpr, effects, name_stack, arg_names=arg_names,
@@ -2607,7 +2665,7 @@ def _wrap_with_spmd_op(name: str,
                        ctx: LoweringRuleContext,
                        x: ir.Value,
                        aval_out: core.AbstractValue,
-                       sharding: xc.OpSharding | SdyArraySharding,
+                       sharding: xc.OpSharding | SdyArray,
                        unspecified_dims: set[int] | None = None,
                        has_side_effect: bool = False,
                        allow_shardy_lowering: bool = False):
@@ -2672,7 +2730,7 @@ def lower_with_sharding_in_types(ctx, op, aval, sharding_proto=None):
     return wrap_with_sharding_op(ctx, op, aval, proto, unspecified_dims)
 
 
-def set_sharding(op, sharding: xc.OpSharding | SdyArraySharding | SdyArrayShardingList):
+def set_sharding(op, sharding: xc.OpSharding | SdyArray | SdyArrayList):
   if config.use_shardy_partitioner.value:
     op.attributes["sdy.sharding"] = get_sharding_attr(sharding)
   else:
@@ -2680,7 +2738,7 @@ def set_sharding(op, sharding: xc.OpSharding | SdyArraySharding | SdyArrayShardi
 
 
 def get_sharding_attr(
-    sharding: xc.OpSharding | SdyArraySharding | SdyArrayShardingList
+    sharding: xc.OpSharding | SdyArray | SdyArrayList
 ) -> ir.Attribute:
   if config.use_shardy_partitioner.value:
     return sharding.build()  # type: ignore
@@ -3032,7 +3090,7 @@ def refine_polymorphic_shapes(module: ir.Module) -> ir.Module:
   Then verifies that there are no more dynamic shapes in the module.
   """
   try:
-    refine_polymorphic_shapes = partial(xla_extension.mlir.refine_polymorphic_shapes,
+    refine_polymorphic_shapes = partial(_jax.mlir.refine_polymorphic_shapes,
             mlir_module=module_to_bytecode(module),
             enable_shape_assertions=True,
             validate_static_shapes=True)

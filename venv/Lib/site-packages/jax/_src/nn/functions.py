@@ -661,9 +661,9 @@ def _one_hot(x: Array, num_classes: int, *,
       "The error arose in jax.nn.one_hot argument `num_classes`.")
   dtype = dtypes.canonicalize_dtype(dtype)
   try:
-    output_pos_axis = util.canonicalize_axis(axis, x.ndim + 1)
+    output_pos_axis = util.canonicalize_axis(axis, x.ndim + 1)  # type: ignore[arg-type]
   except TypeError:
-    axis_size = lax.psum(1, axis)
+    axis_size = lax.axis_size(axis)
     if num_classes != axis_size:
       raise ValueError(f"Expected num_classes to match the size of axis {axis}, "
                        f"but {num_classes} != {axis_size}") from None

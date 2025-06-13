@@ -133,7 +133,6 @@ def debug_callback_transpose_rule(*flat_args, callback: Callable[..., Any],
 ad.primitive_transposes[debug_callback_p] = debug_callback_transpose_rule
 
 def _debug_callback_partial_auto(axis_context, *args, **params):
-  from jax.experimental.shard_map import shard_map
   partial_auto = list(set(axis_context.mesh.axis_names) - axis_context.manual_axes)
   def f():
     idx = jax.lax.with_sharding_constraint(
@@ -142,7 +141,7 @@ def _debug_callback_partial_auto(axis_context, *args, **params):
     return jax.lax.cond(idx == 0,
                         lambda: debug_callback_p.bind(*args, **params),
                         lambda: [])
-  return shard_map(f, axis_context.mesh, in_specs=(), out_specs=[])()
+  return jax.shard_map(f, in_specs=(), out_specs=[])()
 
 def debug_callback_lowering(ctx, *args, effect, partitioned, callback, **params):
   axis_context = ctx.module_context.axis_context
@@ -165,14 +164,16 @@ def debug_callback_lowering(ctx, *args, effect, partitioned, callback, **params)
       # If we have fully manual sharding during lowering, that means the JAX
       # program has per-device semantics, so we run the callback on each device.
       if config.use_shardy_partitioner.value:
-        assert len(ctx.avals_out) == 1
-        sharding = sharding_impls.SdyArrayShardingList([
-            sharding_impls.SdyArraySharding(
+        ndim = 0
+        if ctx.avals_out and isinstance(ctx.avals_out[0], core.ShapedArray):
+          ndim = ctx.avals_out[0].ndim
+        sharding = sharding_impls.SdyArrayList([
+            sharding_impls.SdyArray(
                 mesh_shape=(),
-                dimension_shardings=[
-                    sharding_impls.SdyDimSharding(axes=[], is_open=False)
-                ] * ctx.avals_out[0].ndim,
-                logical_device_ids=())])
+                dim_shardings=[
+                    sharding_impls.SdyDim(axes=[], is_open=False)
+                ] * ndim,
+                logical_device_ids=(0,))])
       else:
         sharding = xc.OpSharding()
         sharding.type = xc.OpSharding.Type.MANUAL
@@ -183,9 +184,9 @@ def debug_callback_lowering(ctx, *args, effect, partitioned, callback, **params)
     # program has bulk array semantics, so we run the callback with a MAXIMAL
     # sharding and hence execute it only once on the full logical value).
     if config.use_shardy_partitioner.value:
-      sharding = sharding_impls.SdyArrayShardingList([
-          sharding_impls.SdyArraySharding(
-              mesh_shape=(), dimension_shardings=[], logical_device_ids=(0,))])
+      sharding = sharding_impls.SdyArrayList([
+          sharding_impls.SdyArray(
+              mesh_shape=(), dim_shardings=[], logical_device_ids=(0,))])
     else:
       sharding = xc.OpSharding()
       sharding.type = xc.OpSharding.Type.MAXIMAL
@@ -460,6 +461,7 @@ def _inspect_sharding_lowering_rule(ctx: mlir.LoweringRuleContext, value, *,
       mesh = mesh_lib.Mesh(np.array(devices).reshape(am.axis_sizes),
                            am.axis_names)
   elif isinstance(axis_context, sharding_impls.SPMDAxisContext):
+    mesh = axis_context.mesh
     devices = axis_context.mesh._flat_devices_tuple
   else:
     raise NotImplementedError(type(axis_context))
@@ -471,7 +473,8 @@ def _inspect_sharding_lowering_rule(ctx: mlir.LoweringRuleContext, value, *,
     if mesh.empty:
       return callback(
           sharding_impls._op_sharding_to_pos_sharding(hlo_sharding, devices))
-    pspec = parse_flatten_op_sharding(hlo_sharding, mesh)[0]
+    pspec = (P() if hlo_sharding.is_manual() else
+             parse_flatten_op_sharding(hlo_sharding, mesh)[0])
     return callback(NamedSharding(mesh, pspec))
 
   if len(devices) == 1:

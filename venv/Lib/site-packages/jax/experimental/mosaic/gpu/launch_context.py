@@ -25,6 +25,7 @@ from jax._src.lib import mosaic_gpu_dialect as mgpu_dialect
 from jax._src import lib as jaxlib
 from jaxlib.mlir import ir
 from jaxlib.mlir.dialects import arith
+from jaxlib.mlir.dialects import builtin
 from jaxlib.mlir.dialects import func
 from jaxlib.mlir.dialects import gpu
 from jaxlib.mlir.dialects import llvm
@@ -231,20 +232,110 @@ OnDeviceProfiler = profiler.OnDeviceProfiler
 
 ReductionOp = Literal["add", "min", "max", "inc", "dec", "and", "or", "xor"]
 
+class Scratch:
+  """Manages ops handling the GMEM scratch that contains the TMA descriptors.
+
+  TMA descriptors are created on the host and then copied to GMEM. So there
+  needs to be some code on the host to allocate and initialize the TMA
+  descriptors. However, we only know what descriptors we need after we have
+  lowered the entire kernel. This class helps manage everything needed to
+  correctly allocate and initialize the scratch.
+
+  To help reconcile the needs of kernels that use the dialect lowering with
+  those that use MGPU APIs directly, this class only creates the relevant ops
+  lazily. Eager creation would make them appear dead before dialect lowering
+  and MLIR's DCE would remove them.
+
+  During the lowering, we collect information about how many bytes are needed
+  and also how each descriptor should be initialized on the host. At the end
+  of the lowering, the finalize_size() method should be called to add the
+  necessary code on the host to allocate and initialize all descriptors.
+  """
+  def __init__(self, gpu_launch_op: gpu.LaunchOp):
+    self.next_offset: int = 0
+    self.host_init: list[Callable[[ir.Value], None]] = []
+    self._alloc_op = None
+    self._load_op = None
+    self._scratch_ptr = None
+
+    # Ideally, we would store the gpu.launch op directly. However, it gets
+    # invalidated by passes like "canonicalize". Thus we store the module and
+    # find the gpu.launch op from there when needed.
+    op = gpu_launch_op
+    while op.name != "builtin.module":
+      op = op.parent.opview
+    assert op is not None
+    self._module_op = op
+
+  def _find_gpu_launch_op(self, block: ir.Block) -> ir.OpView | None:
+    for op in block:
+      if op.name == "gpu.launch":
+        return op
+      for region in op.regions:
+        for block in region:
+          child_op = self._find_gpu_launch_op(block)
+          if child_op is not None:
+            return child_op
+    return None
+
+  def _create_ops_if_none(self):
+    if self._alloc_op is not None:
+      return
+
+    gpu_launch_op = self._find_gpu_launch_op(self._module_op.body)
+    assert gpu_launch_op is not None
+    ptr_ty = ir.Type.parse("!llvm.ptr")
+    with ir.InsertionPoint(gpu_launch_op):
+      empty_arr_ty = ir.Type.parse("!llvm.array<0 x i8>")
+      i64 = ir.IntegerType.get_signless(64)
+      self._alloc_op = llvm.AllocaOp(
+          ptr_ty, c(1, i64), empty_arr_ty,
+          alignment=TMA_DESCRIPTOR_ALIGNMENT
+      )
+      self._load_op = llvm.LoadOp(empty_arr_ty, self._alloc_op)
+
+    with ir.InsertionPoint.at_block_begin(gpu_launch_op.body.blocks[0]):
+      self._scratch_ptr = builtin.unrealized_conversion_cast(
+          [ptr_ty], [self._load_op]
+      )
+
+  def device_ptr(self) -> ir.Value:
+    self._create_ops_if_none()
+    return self._scratch_ptr
+
+  def finalize_size(self):
+    """
+    Allocates and initializes the host buffer. This needs to be done after
+    lowering, i.e. after all TMA descriptors have been recorded. Only then we
+    know what the scratch contains.
+    """
+    if self.next_offset == 0:
+      return
+    assert self._alloc_op is not None
+    with ir.InsertionPoint(self._load_op):
+      gmem_scratch_bytes = self.next_offset
+      scratch_arr_ty = ir.Type.parse(f"!llvm.array<{gmem_scratch_bytes} x i8>")
+      self._alloc_op.elem_type = ir.TypeAttr.get(scratch_arr_ty)
+      self._load_op.result.set_type(scratch_arr_ty)
+      for init_callback in self.host_init:
+        init_callback(self._alloc_op.result)
+
+
+class _DefaultPredicate:
+  pass
+
+
 @dataclasses.dataclass()
 class LaunchContext:
-  launch_op: gpu.LaunchOp
-  gmem_scratch_ptr: ir.Value
+  module: ir.Module
+  scratch: Scratch
   cluster_size: tuple[int, int, int]
   profiler: OnDeviceProfiler | None = None
-  next_scratch_offset: int = 0
-  host_scratch_init: list[Callable[[ir.Value], None]] = dataclasses.field(
-      default_factory=list, init=False
-  )
   tma_descriptors: dict[
       tuple[ir.Value, tuple[int, ...], int | None, tuple[MemRefTransform, ...]],
       ir.Value,
   ] = dataclasses.field(default_factory=dict, init=False)
+  is_device_collective: bool = False
 
   @contextlib.contextmanager
   def named_region(self, *args, **kwargs):
@@ -288,21 +379,21 @@ class LaunchContext:
     ptr_ty = ir.Type.parse("!llvm.ptr")
     if alignment is None:
       alignment = size
-    if self.next_scratch_offset % alignment:
+    if self.scratch.next_offset % alignment:
       raise NotImplementedError  # TODO(apaszke): Pad to match alignment
-    alloc_base = self.next_scratch_offset
-    self.next_scratch_offset += size
+    alloc_base = self.scratch.next_offset
+    self.scratch.next_offset += size
     def host_init_wrapped(host_ptr):
       host_init(
-          llvm.getelementptr(ptr_ty, host_ptr, [], [alloc_base], i8)
+          llvm.getelementptr(ptr_ty, host_ptr, [], [alloc_base], i8, llvm.GEPNoWrapFlags.none)
       )
-    self.host_scratch_init.append(host_init_wrapped)
+    self.scratch.host_init.append(host_init_wrapped)
     # with ir.InsertionPoint(self.gmem_scratch_ptr.owner):
     # There is no way to create an insertion point after an operation...
     gep = llvm.GEPOp(
-        ptr_ty, self.gmem_scratch_ptr, [], [alloc_base], i8
+        ptr_ty, self.scratch.device_ptr(), [], [alloc_base], i8, llvm.GEPNoWrapFlags.none
     )
-    gep.move_after(self.gmem_scratch_ptr.owner)
+    gep.move_after(self.scratch.device_ptr().owner)
     return device_init(gep.result)
 
   def _get_tma_desc(
@@ -339,7 +430,7 @@ class LaunchContext:
         alloc_ptr = llvm.inttoptr(ptr_ty, as_i64(aligned_ptr_idx))
         llvm_dyn = -2147483648  # TODO(apaszke): Improve the MLIR bindings...
         base_ptr = llvm.getelementptr(
-            ptr_ty, alloc_ptr, [as_i64(offset)], [llvm_dyn], ref_ty.element_type,
+            ptr_ty, alloc_ptr, [as_i64(offset)], [llvm_dyn], ref_ty.element_type, llvm.GEPNoWrapFlags.none,
         )
         rank = ref_ty.rank
         assert rank * 2 == len(sizes_and_strides)
@@ -369,12 +460,19 @@ class LaunchContext:
               tma_dtype = 3
             elif bitwidth == 64:
               tma_dtype = 4
+            else:
+              raise ValueError(f"Unsupported integer bitwidth: {bitwidth}")
           elif ir.F16Type.isinstance(ref_ty.element_type):
             tma_dtype = 5
           elif ir.F32Type.isinstance(ref_ty.element_type):
             tma_dtype = 6
           elif ir.BF16Type.isinstance(ref_ty.element_type):
             tma_dtype = 7
+          # We treat 8 bit floats as 8 bit integers
+          elif ir.Float8E5M2Type.isinstance(ref_ty.element_type):
+            tma_dtype = 1
+          elif ir.Float8E4M3FNType.isinstance(ref_ty.element_type):
+            tma_dtype = 1
           else:
             raise ValueError(f"unsupported TMA dtype {ref_ty.element_type}")
           dtype_or_bitwidth = c(tma_dtype, i64)
@@ -412,12 +510,10 @@ class LaunchContext:
       barrier: utils.BarrierRef | None = None,
       swizzle: int | None = None,
       arrive: bool | None = None,
-      uniform: bool = True,
       collective: Sequence[gpu.Dimension] | gpu.Dimension | None = None,
       partitioned: int | None = None,
-      predicate: (
-          ir.Value | None
-      ) = None,  # Should select 0 or 1 threads from the WG.
+      # Should select 0 or 1 threads from the WG.
+      predicate: ir.Value | None | _DefaultPredicate = _DefaultPredicate(),
       reduction_op: ReductionOp | None = None,
   ):
     """Initiates an async copy between GMEM and SMEM.
@@ -459,8 +555,8 @@ class LaunchContext:
           f"Expected same element type, got {element_type} and"
           f" {dst_ref_ty.element_type}"
       )
-    if predicate is not None and not uniform:
-      raise ValueError("Predicate can only be defined when uniform is True")
+    if isinstance(predicate, _DefaultPredicate):
+      predicate = utils.single_thread_predicate(utils.ThreadSubset.WARPGROUP)
     if not isinstance(gmem_transform, tuple):
       gmem_transform = (gmem_transform,)
 
@@ -497,12 +593,18 @@ class LaunchContext:
           " multiple of 16 bytes"
       )
 
-    if reduction_op is not None and jaxlib.version < (0, 5, 4):
-      raise ValueError("TMA with reduction is only supported with jaxlib >= 0.5.4")
-    if reduction_op is not None and not isinstance(gmem_ref_ty.element_type, ir.FloatType):
-      raise ValueError("TMA with reduction is only supported with float dtype")
-    if reduction_op is not None and reduction_op != "add":
-      raise ValueError("TMA with reduction is only supported with add operation")
+    if reduction_op is not None:
+      if not any(
+          t.isinstance(gmem_ref_ty.element_type)
+          for t in (ir.F32Type, ir.BF16Type, ir.F16Type)
+      ):
+        raise ValueError(
+            "TMA with reduction is only supported with f32, f16 and bf16"
+        )
+      if reduction_op != "add":
+        raise ValueError(
+            "TMA with reduction is only supported with add operation"
+        )
 
     # NOTE: TMA supports OOB indices, so we skip the check.
     base_indices, slice_shape, is_squeezed = utils.parse_indices(
@@ -656,13 +758,6 @@ class LaunchContext:
         arith.index_cast(i32, idx) for idx in reversed(dyn_base_indices)
     ]
 
-    uniform_ctx = (
-        functools.partial(
-            utils.single_thread, scope=utils.ThreadSubset.WARPGROUP)
-        if uniform and predicate is None
-        else contextlib.nullcontext
-    )
-
     if max(slice_shape) > 256:
       raise ValueError(
           "Async copies only support copying <=256 elements along each"
@@ -692,71 +787,109 @@ class LaunchContext:
           np.prod(slice_shape) * element_bitwidth * collective_size // 8, i32
       )
       barrier_ptr = barrier.get_ptr()
-      with uniform_ctx():
-        assert reduction_op is None
-        if collective_size > 1 and partitioned is not None:
-          if predicate is None:
-            predicate = c(1, ir.IntegerType.get_signless(1))
-          if arrive:
-            first_block = arith.cmpi(
-                arith.CmpIPredicate.eq, self.cluster_idx(collective), c(0, index),
-            )
-            arrive_predicate = arith.andi(predicate, first_block)
-            nvvm.mbarrier_arrive_expect_tx_shared(
-                barrier_ptr, transfer_bytes, predicate=arrive_predicate
-            )
-          rank = len(slice_shape)
-          idx_operands = ",".join(f"${i}" for i in range(4, 4 + rank))
-          llvm.inline_asm(
-              ir.Type.parse("!llvm.void"),
-              [predicate, smem_ptr, tma_desc, barrier_ptr, *rev_dyn_base_indices],
-              f"""
-              {{
-              .reg .b32 mapped_addr;
-              @$0 mapa.shared::cluster.u32 mapped_addr, $3, 0;
-              @$0 cp.async.bulk.tensor.{rank}d.shared::cta.global.tile.mbarrier::complete_tx::bytes.cta_group::2
-                                   [$1], [$2, {{{idx_operands}}}], [mapped_addr];
-              }}
-              """,
-              "b,r,l,r" + ",r" * rank,
-              has_side_effects=True,
+      assert reduction_op is None
+      if collective_size > 1 and partitioned is not None:
+        if predicate is None:
+          predicate = c(1, ir.IntegerType.get_signless(1))
+        if arrive:
+          first_block = arith.cmpi(
+              arith.CmpIPredicate.eq, self.cluster_idx(collective), c(0, index),
           )
-        else:
-          if arrive:
-            nvvm.mbarrier_arrive_expect_tx_shared(
-                barrier_ptr, transfer_bytes, predicate=predicate
-            )
-          nvvm.cp_async_bulk_tensor_shared_cluster_global(
-              smem_ptr, tma_desc, rev_dyn_base_indices, barrier_ptr, [],
-              multicast_mask=multicast_mask, predicate=predicate
+          arrive_predicate = arith.andi(predicate, first_block)
+          nvvm.mbarrier_arrive_expect_tx_shared(
+              barrier_ptr, transfer_bytes, predicate=arrive_predicate
           )
+        rank = len(slice_shape)
+        idx_operands = ",".join(f"${i}" for i in range(4, 4 + rank))
+        llvm.inline_asm(
+            ir.Type.parse("!llvm.void"),
+            [predicate, smem_ptr, tma_desc, barrier_ptr, *rev_dyn_base_indices],
+            f"""
+            {{
+            .reg .b32 mapped_addr;
+            @$0 mapa.shared::cluster.u32 mapped_addr, $3, 0;
+            @$0 cp.async.bulk.tensor.{rank}d.shared::cta.global.tile.mbarrier::complete_tx::bytes.cta_group::2
+                                  [$1], [$2, {{{idx_operands}}}], [mapped_addr];
+            }}
+            """,
+            "b,r,l,r" + ",r" * rank,
+            has_side_effects=True,
+        )
+      else:
+        if arrive:
+          nvvm.mbarrier_arrive_expect_tx_shared(
+              barrier_ptr, transfer_bytes, predicate=predicate
+          )
+        nvvm.cp_async_bulk_tensor_shared_cluster_global(
+            smem_ptr, tma_desc, rev_dyn_base_indices, barrier_ptr, [],
+            multicast_mask=multicast_mask, predicate=predicate
+        )
     else:
       assert multicast_mask is None
       if reduction_op is not None:
-        with uniform_ctx():
-          if predicate is None:
-            predicate = c(1, ir.IntegerType.get_signless(1))
-          rank = len(slice_shape)
-          idx_operands = ",".join(f"${i}" for i in range(3, 3 + rank))
-          llvm.inline_asm(
-            ir.Type.parse("!llvm.void"),
-            [predicate,smem_ptr,tma_desc,*rev_dyn_base_indices],
-            f"@$0 cp.reduce.async.bulk.tensor.{rank}d.global.shared::cta.{reduction_op}.tile.bulk_group [$2,{{{idx_operands}}}], [$1];",
-            "b,r,l" + ",r" * rank,
-            has_side_effects=True,
-          )
-          if arrive:
-            nvvm.cp_async_bulk_commit_group()
+        if predicate is None:
+          predicate = c(1, ir.IntegerType.get_signless(1))
+        rank = len(slice_shape)
+        idx_operands = ",".join(f"${i}" for i in range(3, 3 + rank))
+        llvm.inline_asm(
+          ir.Type.parse("!llvm.void"),
+          [predicate,smem_ptr,tma_desc,*rev_dyn_base_indices],
+          f"@$0 cp.reduce.async.bulk.tensor.{rank}d.global.shared::cta.{reduction_op}.tile.bulk_group [$2,{{{idx_operands}}}], [$1];",
+          "b,r,l" + ",r" * rank,
+          has_side_effects=True,
+        )
+        if arrive:
+          nvvm.cp_async_bulk_commit_group()
       else:
-        with uniform_ctx():
-          nvvm.cp_async_bulk_tensor_global_shared_cta(
-              tma_desc, smem_ptr, rev_dyn_base_indices, predicate=predicate
-          )
-          if arrive:
-            nvvm.cp_async_bulk_commit_group()
+        nvvm.cp_async_bulk_tensor_global_shared_cta(
+            tma_desc, smem_ptr, rev_dyn_base_indices, predicate=predicate
+        )
+        if arrive:
+          nvvm.cp_async_bulk_commit_group()
 
   def await_async_copy(
       self, allow_groups: int, await_read_only: bool = False
   ):
     nvvm.cp_async_bulk_wait_group(allow_groups, read=await_read_only)
     utils.warpgroup_barrier()
+
+  def _ensure_nvshmem_decls(self):
+    if self.is_device_collective:
+      return
+    self.is_device_collective = True
+    with ir.InsertionPoint(self.module.body):
+      nvshmem_my_pe_type = ir.TypeAttr.get(ir.Type.parse("!llvm.func<i32()>"))
+      llvm.LLVMFuncOp(
+          "nvshmem_my_pe", nvshmem_my_pe_type, sym_visibility="private"
+      )
+      nvshmem_ptr_type = ir.TypeAttr.get(
+          ir.Type.parse("!llvm.func<!llvm.ptr(!llvm.ptr,i32)>")
+      )
+      llvm.LLVMFuncOp("nvshmem_ptr", nvshmem_ptr_type, sym_visibility="private")
+
+  def to_remote(self, ref: ir.Value, peer: ir.Value):
+    self._ensure_nvshmem_decls()
+    if ir.MemRefType.isinstance(ref.type):
+      # We replace the offset in the ref type by 0, because memref_ptr always
+      # folds the offset into the pointer.
+      ref_ty = ir.MemRefType(ref.type)
+      strides, _ = ref_ty.get_strides_and_offset()
+      result_type = ir.MemRefType.get(
+          ref_ty.shape,
+          ref_ty.element_type,
+          ir.StridedLayoutAttr.get(0, strides),
+          ref_ty.memory_space,
+      )
+      return utils.ptr_as_memref(
+          self.to_remote(utils.memref_ptr(ref), peer), result_type
+      )
+    if ref.type != ir.Type.parse("!llvm.ptr"):
+      raise ValueError(f"Unsupported type for to_remote: {ref.type}")
+    if peer.type != ir.IntegerType.get_signless(32):
+      raise ValueError(f"peer index must be an i32, got {peer.type}")
+    return llvm.call(ref.type, [ref, peer], [], [], callee="nvshmem_ptr")
+
+  def device_id(self) -> ir.Value:
+    self._ensure_nvshmem_decls()
+    i32 = ir.IntegerType.get_signless(32)
+    return llvm.call(i32, [], [], [], callee="nvshmem_my_pe")

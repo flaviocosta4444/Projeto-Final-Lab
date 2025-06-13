@@ -23,7 +23,6 @@ import functools
 from typing import Any, ClassVar, Literal
 
 import jax
-from jax._src import config
 from jax._src import core as jax_core
 from jax._src import util
 from jax._src.pallas import core as pallas_core
@@ -48,15 +47,22 @@ _convert_block_spec_to_block_mapping = pallas_core._convert_block_spec_to_block_
 _out_shape_to_aval_mapping = pallas_core._out_shape_to_aval_mapping
 split_list = util.split_list
 
-_ENABLE_RUNTIME_ASSERT = config.bool_state(
-    "jax_pallas_enable_runtime_assert",
-    default=False,
-    help=(
-        "If set, enables runtime assertions in the kernel via checkify.check."
-        " Otherwise, runtime asserts will be ignored unless functionalized"
-        " using checkify.checkify."
-    ),
-)
+
+class KernelType(enum.Enum):
+  TC = 0
+  SC_SCALAR_SUBCORE = 1
+  SC_VECTOR_SUBCORE = 2
+
+
+class GridDimensionSemantics(enum.Enum):
+  PARALLEL = "parallel"
+  ARBITRARY = "arbitrary"
+
+PARALLEL = GridDimensionSemantics.PARALLEL
+ARBITRARY = GridDimensionSemantics.ARBITRARY
+
+
+DimensionSemantics = Literal["parallel", "arbitrary"] | GridDimensionSemantics
 
 
 @dataclasses.dataclass(frozen=True)
@@ -79,13 +85,10 @@ class TPUCompilerParams(pallas_core.CompilerParams):
       Mosaic.
     flags: A dictionary of command line flags for the kernel.
     serialization_format: The serialization format for the kernel body.
-    device_type: The device type to compile for.
     disable_bounds_checks: Disable bounds checks in the kernel.
   """
-  PLATFORM: ClassVar[str] = "mosaic"
-  dimension_semantics: (
-      Sequence[Literal["parallel", "arbitrary"] | GridDimensionSemantics] | None
-  ) = None
+  BACKEND: ClassVar[pallas_core.Backend] = "mosaic_tpu"
+  dimension_semantics: Sequence[DimensionSemantics] | None = None
   allow_input_fusion: Sequence[bool] | None = None
   vmem_limit_bytes: int | None = None
   collective_id: int | None = None
@@ -93,7 +96,7 @@ class TPUCompilerParams(pallas_core.CompilerParams):
   flags: dict[str, Any] | None = None
   internal_scratch_in_bytes: int | None = None
   serialization_format: int = 1
-  device_type: str | None = None
+  kernel_type: KernelType = KernelType.TC
   disable_bounds_checks: bool = False
 
   # Replace is a method, not a field.
@@ -191,21 +194,20 @@ class TensorCoreMesh:
 
 
 def create_tensorcore_mesh(
-    axis_name: str, devices: Sequence[jax.Device] | None = None
+    axis_name: str,
+    devices: Sequence[jax.Device] | None = None,
+    num_cores: int | None = None,
 ) -> TensorCoreMesh:
-  # TODO(b/355036384): emit a better error if we don't have tensorcores.
-  if devices is None:
-    devices = jax.devices()
-  num_cores = devices[0].num_cores
+  if devices is not None and num_cores is not None:
+    raise ValueError('cannot specify both devices and num_cores')
+  if num_cores is None:
+    if devices is None:
+      devices = jax.devices()
+    num_cores = devices[0].num_cores
   return TensorCoreMesh(
       np.array([TensorCore(i) for i in range(num_cores)]),
       [axis_name],
   )
-
-
-def runtime_assert_enabled() -> bool:
-  """Returns whether runtime asserts are enabled."""
-  return _ENABLE_RUNTIME_ASSERT.value
 
 
 def _tensorcore_mesh_discharge_rule(
@@ -215,7 +217,7 @@ def _tensorcore_mesh_discharge_rule(
     mesh,
     jaxpr,
     compiler_params: Any | None,
-    interpret: bool,
+    interpret: Any,
     debug: bool,
     cost_estimate: pallas_core.CostEstimate | None,
     name: str,
@@ -262,10 +264,3 @@ def _convert_semaphore_type_to_aval(
 pallas_core._out_shape_to_aval_mapping[SemaphoreType] = (
     _convert_semaphore_type_to_aval
 )
-
-
-class GridDimensionSemantics(enum.Enum):
-  PARALLEL = "parallel"
-  ARBITRARY = "arbitrary"
-PARALLEL = GridDimensionSemantics.PARALLEL
-ARBITRARY = GridDimensionSemantics.ARBITRARY

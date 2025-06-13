@@ -26,7 +26,7 @@ __all__ = ['register_jax_array_methods']
 import abc
 from functools import partial, wraps
 import math
-from typing import Any, Sequence
+from typing import Any, Callable, Sequence
 
 import numpy as np
 import jax
@@ -197,12 +197,12 @@ def _dot(self: Array, b: ArrayLike, *, precision: lax_internal.PrecisionLike = N
   """
   return tensor_contractions.dot(self, b, precision=precision, preferred_element_type=preferred_element_type)
 
-def _flatten(self: Array, order: str = "C") -> Array:
+def _flatten(self: Array, order: str = "C", *, out_sharding=None) -> Array:
   """Flatten array into a 1-dimensional shape.
 
   Refer to :func:`jax.numpy.ravel` for the full documentation.
   """
-  return lax_numpy.ravel(self, order=order)
+  return lax_numpy.ravel(self, order=order, out_sharding=out_sharding)
 
 def _imag_property(self: Array) -> Array:
   """Return the imaginary part of the array."""
@@ -293,14 +293,18 @@ def _real_property(self: Array) -> Array:
   return ufuncs.real(self)
 
 def _repeat(self: Array, repeats: ArrayLike, axis: int | None = None, *,
-            total_repeat_length: int | None = None) -> Array:
+            total_repeat_length: int | None = None,
+            out_sharding: NamedSharding | PartitionSpec | None = None) -> Array:
   """Construct an array from repeated elements.
 
   Refer to :func:`jax.numpy.repeat` for the full documentation.
   """
-  return lax_numpy.repeat(self, repeats=repeats, axis=axis, total_repeat_length=total_repeat_length)
+  return lax_numpy.repeat(self, repeats=repeats, axis=axis,
+                          total_repeat_length=total_repeat_length,
+                          out_sharding=out_sharding)
 
-def _reshape(self: Array, *args: Any, order: str = "C") -> Array:
+def _reshape(self: Array, *args: Any, order: str = "C", out_sharding=None
+             ) -> Array:
   """Returns an array containing the same data with a new shape.
 
   Refer to :func:`jax.numpy.reshape` for full documentation.
@@ -308,10 +312,10 @@ def _reshape(self: Array, *args: Any, order: str = "C") -> Array:
   __tracebackhide__ = True
   newshape = _compute_newshape(self, args[0] if len(args) == 1 else args)
   if order == "C":
-    return lax.reshape(self, newshape, None)
+    return lax.reshape(self, newshape, None, out_sharding=out_sharding)
   elif order == "F":
     dims = list(range(self.ndim)[::-1])
-    return lax.reshape(self, newshape[::-1], dims).T
+    return lax.reshape(self, newshape[::-1], dims, out_sharding=out_sharding).T
   elif order == "A":
     raise NotImplementedError("np.reshape order=A is not implemented.")
   else:
@@ -740,13 +744,15 @@ class _IndexUpdateHelper:
   """
   __slots__ = ("array",)
 
-  def __init__(self, array):
+  array: Array
+
+  def __init__(self, array: Array):
     self.array = array
 
-  def __getitem__(self, index):
+  def __getitem__(self, index: scatter.Index) -> _IndexUpdateRef:
     return _IndexUpdateRef(self.array, index)
 
-  def __repr__(self):
+  def __repr__(self) -> str:
     return f"_IndexUpdateHelper({self.array!r})"
 
 
@@ -759,15 +765,19 @@ class _IndexUpdateRef:
   """
   __slots__ = ("array", "index")
 
-  def __init__(self, array, index):
+  array: Array
+  index: scatter.Index
+
+  def __init__(self, array: Array, index: scatter.Index):
     self.array = array
     self.index = index
 
   def __repr__(self) -> str:
     return f"_IndexUpdateRef({self.array!r}, {self.index!r})"
 
-  def get(self, *, indices_are_sorted=False, unique_indices=False,
-          mode=None, fill_value=None, out_sharding=None):
+  def get(self, *, indices_are_sorted: bool = False, unique_indices: bool = False,
+          mode: str | jax.lax.GatherScatterMode | None = None,
+          fill_value: ArrayLike | None = None, out_sharding: Sharding | None = None):
     """Equivalent to ``x[idx]``.
 
     Returns the value of ``x`` that would result from the NumPy-style
@@ -786,8 +796,9 @@ class _IndexUpdateRef:
                                    fill_value=fill_value,
                                    out_sharding=out_sharding)
 
-  def set(self, values, *, indices_are_sorted=False, unique_indices=False,
-          mode=None):
+  def set(self, values: ArrayLike, *, indices_are_sorted: bool = False,
+          unique_indices: bool = False,
+          mode: str | jax.lax.GatherScatterMode | None = None) -> None:
     """Pure equivalent of ``x[idx] = y``.
 
     Returns the value of ``x`` that would result from the NumPy-style
@@ -795,12 +806,17 @@ class _IndexUpdateRef:
 
     See :mod:`jax.ops` for details.
     """
+    out_s = core.typeof(self.array).sharding
+    if out_s.mesh.empty or out_s.mesh._are_all_axes_auto_or_manual:
+      out_s = None
     return scatter._scatter_update(self.array, self.index, values, lax.scatter,
                                    indices_are_sorted=indices_are_sorted,
-                                   unique_indices=unique_indices, mode=mode)
+                                   unique_indices=unique_indices, mode=mode,
+                                   out_sharding=out_s)
 
-  def apply(self, func, *, indices_are_sorted=False, unique_indices=False,
-            mode=None):
+  def apply(self, func: Callable[[ArrayLike], Array], *,
+            indices_are_sorted: bool = False, unique_indices: bool = False,
+            mode: str | jax.lax.GatherScatterMode | None = None) -> Array:
     """Pure equivalent of ``func.at(x, idx)`` for a unary ufunc ``func``.
 
     Returns the value of ``x`` that would result from applying the unary
@@ -822,8 +838,9 @@ class _IndexUpdateRef:
                                    indices_are_sorted=indices_are_sorted,
                                    unique_indices=unique_indices, mode=mode)
 
-  def add(self, values, *, indices_are_sorted=False, unique_indices=False,
-          mode=None):
+  def add(self, values: ArrayLike, *,
+          indices_are_sorted: bool = False, unique_indices: bool = False,
+          mode: str | jax.lax.GatherScatterMode | None = None) -> Array:
     """Pure equivalent of ``x[idx] += y``.
 
     Returns the value of ``x`` that would result from the NumPy-style
@@ -836,8 +853,9 @@ class _IndexUpdateRef:
                                    indices_are_sorted=indices_are_sorted,
                                    unique_indices=unique_indices, mode=mode)
 
-  def subtract(self, values, *, indices_are_sorted=False, unique_indices=False,
-               mode=None):
+  def subtract(self, values: ArrayLike, *,
+               indices_are_sorted: bool = False, unique_indices: bool = False,
+               mode: str | jax.lax.GatherScatterMode | None = None) -> Array:
     """Pure equivalent of ``x[idx] -= y``.
 
     Returns the value of ``x`` that would result from the NumPy-style
@@ -850,8 +868,9 @@ class _IndexUpdateRef:
                                    indices_are_sorted=indices_are_sorted,
                                    unique_indices=unique_indices, mode=mode)
 
-  def multiply(self, values, *, indices_are_sorted=False, unique_indices=False,
-               mode=None):
+  def multiply(self, values: ArrayLike, *,
+               indices_are_sorted: bool = False, unique_indices: bool = False,
+               mode: str | jax.lax.GatherScatterMode | None = None) -> Array:
     """Pure equivalent of ``x[idx] *= y``.
 
     Returns the value of ``x`` that would result from the NumPy-style
@@ -866,8 +885,9 @@ class _IndexUpdateRef:
                                    mode=mode)
   mul = multiply
 
-  def divide(self, values, *, indices_are_sorted=False, unique_indices=False,
-             mode=None):
+  def divide(self, values: ArrayLike, *,
+             indices_are_sorted: bool = False, unique_indices: bool = False,
+             mode: str | jax.lax.GatherScatterMode | None = None) -> Array:
     """Pure equivalent of ``x[idx] /= y``.
 
     Returns the value of ``x`` that would result from the NumPy-style
@@ -882,8 +902,9 @@ class _IndexUpdateRef:
                               indices_are_sorted=indices_are_sorted,
                               unique_indices=unique_indices, mode=mode))
 
-  def power(self, values, *, indices_are_sorted=False, unique_indices=False,
-            mode=None):
+  def power(self, values: ArrayLike, *,
+            indices_are_sorted: bool = False, unique_indices: bool = False,
+            mode: str | jax.lax.GatherScatterMode | None = None) -> Array:
     """Pure equivalent of ``x[idx] **= y``.
 
     Returns the value of ``x`` that would result from the NumPy-style
@@ -898,8 +919,9 @@ class _IndexUpdateRef:
                               indices_are_sorted=indices_are_sorted,
                               unique_indices=unique_indices, mode=mode))
 
-  def min(self, values, *, indices_are_sorted=False, unique_indices=False,
-          mode=None):
+  def min(self, values: ArrayLike, *,
+          indices_are_sorted: bool = False, unique_indices: bool = False,
+          mode: str | jax.lax.GatherScatterMode | None = None) -> Array:
     """Pure equivalent of ``x[idx] = minimum(x[idx], y)``.
 
     Returns the value of ``x`` that would result from the NumPy-style
@@ -913,8 +935,9 @@ class _IndexUpdateRef:
                                    indices_are_sorted=indices_are_sorted,
                                    unique_indices=unique_indices, mode=mode)
 
-  def max(self, values, *, indices_are_sorted=False, unique_indices=False,
-          mode=None):
+  def max(self, values: ArrayLike, *,
+          indices_are_sorted: bool = False, unique_indices: bool = False,
+          mode: str | jax.lax.GatherScatterMode | None = None) -> Array:
     """Pure equivalent of ``x[idx] = maximum(x[idx], y)``.
 
     Returns the value of ``x`` that would result from the NumPy-style
@@ -948,8 +971,6 @@ _array_operators = {
   "rsub": _defer_to_unrecognized_arg("-", ufuncs.subtract, swap=True),
   "mul": _defer_to_unrecognized_arg("*", ufuncs.multiply),
   "rmul": _defer_to_unrecognized_arg("*", ufuncs.multiply, swap=True),
-  "div": _defer_to_unrecognized_arg("/", ufuncs.divide),
-  "rdiv": _defer_to_unrecognized_arg("/", ufuncs.divide, swap=True),
   "truediv": _defer_to_unrecognized_arg("/", ufuncs.true_divide),
   "rtruediv": _defer_to_unrecognized_arg("/", ufuncs.true_divide, swap=True),
   "floordiv": _defer_to_unrecognized_arg("//", ufuncs.floor_divide),

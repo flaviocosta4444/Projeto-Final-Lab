@@ -35,16 +35,18 @@ from jax._src import mesh_utils
 from jax._src.lib import xla_client as xc
 from jax._src.lib.mlir.dialects import sdy
 from jax._src.named_sharding import (  # noqa: F401
-    SdyArraySharding, SdyDimSharding, UnspecifiedValue, AUTO,
+    SdyArray, SdyDim, UnspecifiedValue, AUTO,
     _check_unique_resources, NamedSharding, UNSPECIFIED,
     ArrayMapping, ArrayMappingOrAutoOrUnspecified, get_array_mapping,
-    array_mapping_to_axis_resources, named_sharding_to_xla_hlo_sharding)
+    array_mapping_to_axis_resources, named_sharding_to_xla_hlo_sharding,
+    modify_sdy_sharding_wrt_axis_types)
 from jax._src.op_shardings import (
     are_op_shardings_equal, get_num_ways_dim_sharded, is_op_sharding_replicated)
 from jax._src.partition_spec import PartitionSpec
 from jax._src.util import safe_map, safe_zip, use_cpp_class, use_cpp_method
 import numpy as np
 
+config_ext = xc._xla.config
 
 Shape = tuple[int, ...]
 Device = xc.Device
@@ -86,33 +88,12 @@ def device_replica_id_map(sharding, global_shape: Shape) -> Mapping[Device, int]
 
 
 @dataclasses.dataclass
-class SdyArrayShardingList:
-  shardings: Sequence[SdyArraySharding]
+class SdyArrayList:
+  shardings: Sequence[SdyArray]
 
   def build(self) -> sdy.TensorShardingPerValueAttr:
     return sdy.TensorShardingPerValueAttr.get(
         [sharding.build() for sharding in self.shardings])
-
-
-# TODO(yashkatariya): Upstream this into `_to_sdy_sharding` maybe with an extra
-# parameter to it `_to_sdy_sharding(self, ndim, modify_wrt_axis_types=False)`
-def modify_sdy_sharding_wrt_axis_types(sdy_sharding: SdyArraySharding, mesh):
-  if mesh._any_axis_auto:
-    dim_shardings, used_axes = [], []  # type: ignore
-    for d in sdy_sharding.dimension_shardings:
-      # TODO(yashkatariya): Maybe if any mesh axis is auto, mark all axes as open?
-      dim_shardings.append(SdyDimSharding(axes=[], is_open=True)
-                           if not d.axes and not d.is_open else d)
-      used_axes.extend(d.axes)
-    remaining_axes = set(mesh.axis_names) - set(used_axes)
-    # Sort wrt mesh axis names so order is deterministic and doesn't hang in
-    # McJAX.
-    remaining_axes = [n for n in mesh.axis_names if n in remaining_axes]
-    replicated_axes = tuple(r for r in remaining_axes
-                            if mesh._name_to_type[r] == mesh_lib.AxisType.Explicit)
-    return SdyArraySharding(sdy_sharding.mesh_shape, dim_shardings,
-                            sdy_sharding.logical_device_ids, replicated_axes)
-  return sdy_sharding
 
 
 replicated_hlo_sharding = xc.HloSharding.replicate()
@@ -184,10 +165,10 @@ class SingleDeviceSharding(jsharding.Sharding):
   def _to_xla_hlo_sharding(self, num_dimensions: int) -> xc.HloSharding:
     return replicated_hlo_sharding
 
-  def _to_sdy_sharding(self, num_dimensions: int) -> SdyArraySharding:
-    sdy_dim_sharding = [SdyDimSharding(axes=[], is_open=False)
+  def _to_sdy_sharding(self, num_dimensions: int) -> SdyArray:
+    sdy_dim_sharding = [SdyDim(axes=[], is_open=False)
                         for _ in range(num_dimensions)]
-    return SdyArraySharding(None, sdy_dim_sharding)
+    return SdyArray(mesh_shape=None, dim_shardings=sdy_dim_sharding)
 
   @property
   def is_fully_replicated(self) -> bool:
@@ -199,6 +180,7 @@ class SingleDeviceSharding(jsharding.Sharding):
       return xb.process_index(self._device.client) == self._device.process_index
     return True
 
+SingleDeviceSharding.__module__ = 'jax.sharding'
 
 @util.cache(max_size=4096, trace_context_in_key=False)
 def pmap_sharding_devices_indices_map(
@@ -328,8 +310,8 @@ class PmapSharding(jsharding.Sharding):
   def _to_xla_hlo_sharding(self, num_dimensions: int) -> xc.HloSharding:
     raise NotImplementedError("pmap doesn't use OpSharding.")
 
-  def _to_sdy_sharding(self, num_dimensions: int) -> SdyArraySharding:
-    raise NotImplementedError("pmap doesn't use SdyArraySharding.")
+  def _to_sdy_sharding(self, num_dimensions: int) -> SdyArray:
+    raise NotImplementedError("pmap doesn't use SdyArray.")
 
   @functools.cached_property
   def is_fully_replicated(self) -> bool:
@@ -367,6 +349,7 @@ class PmapSharding(jsharding.Sharding):
           f'the number of devices={len(self._device_assignment)}')
     return sharded_shape
 
+PmapSharding.__module__ = 'jax.sharding'
 
 def _op_sharding_to_pos_sharding(
     op_sharding: xc.OpSharding | xc.HloSharding,
@@ -537,9 +520,9 @@ class PositionalSharding(jsharding.Sharding):
   def _to_xla_hlo_sharding(self, num_dimensions: int) -> xc.HloSharding:
     return _positional_sharding_to_xla_hlo_sharding(self, num_dimensions)
 
-  def _to_sdy_sharding(self, num_dimensions: int) -> SdyArraySharding:
+  def _to_sdy_sharding(self, num_dimensions: int) -> SdyArray:
     raise NotImplementedError(
-        "PositionalSharding can't be converted to an SdyArraySharding.")
+        "PositionalSharding can't be converted to an SdyArray.")
 
   @functools.cached_property
   def is_fully_addressable(self) -> bool:
@@ -654,9 +637,9 @@ class GSPMDSharding(jsharding.Sharding):
   def _to_xla_hlo_sharding(self, num_dimensions: int) -> xc.HloSharding:
     return self._hlo_sharding
 
-  def _to_sdy_sharding(self, num_dimensions: int) -> SdyArraySharding:
+  def _to_sdy_sharding(self, num_dimensions: int) -> SdyArray:
     raise NotImplementedError(
-        "GSPMDSharding can't be converted to SdyArraySharding.")
+        "GSPMDSharding can't be converted to SdyArray.")
 
   @functools.cached_property
   def is_fully_replicated(self) -> bool:
@@ -690,14 +673,20 @@ def prepare_axis_resources(axis_resources, arg_name,
       if isinstance(entry, PmapSharding):
         raise ValueError(f'One of {what} got sharding {entry} which is not '
                          'allowed.')
+      if (not allow_unconstrained_dims and isinstance(entry, NamedSharding) and
+          PartitionSpec.UNCONSTRAINED in entry.spec):
+        raise ValueError(
+            f'Unconstrained dims are not allowed when passed to {arg_name}:'
+            f' {entry}')
       new_entries.append(entry)
     else:
       if not isinstance(entry, PartitionSpec):
         raise TypeError(f"{what} are expected to be "
                         f"PartitionSpec instances or None, but got {entry}")
-      for e in entry:
-        if e is PartitionSpec.UNCONSTRAINED and not allow_unconstrained_dims:
-          raise ValueError(f"Unconstrained dims are not allowed: {entry}")
+      if not allow_unconstrained_dims and PartitionSpec.UNCONSTRAINED in entry:
+        raise ValueError(
+            f'Unconstrained dims are not allowed when passed to {arg_name}:'
+            f' {entry}')
       _check_unique_resources(entry, arg_name)
       new_entries.append(entry)
 
@@ -1235,7 +1224,7 @@ def logical_sharding(logical_shape, dtype, phys_sharding) -> jsharding.Sharding:
       phys_spec = (*phys_sharding.spec,
                    *[None] * (len(phys_shape) - len(phys_sharding.spec)))
     else:
-      phys_spec = phys_sharding.spec
+      phys_spec = phys_sharding.spec  # type: ignore
     return phys_sharding.with_spec(phys_spec[:-elt_aval.ndim])
   else:
     return get_logical_gspmd_sharding(logical_shape, dtype, phys_sharding)
@@ -1243,7 +1232,8 @@ def logical_sharding(logical_shape, dtype, phys_sharding) -> jsharding.Sharding:
 
 @util.cache()
 def create_mesh_pspec_sharding(
-    mesh: mesh_lib.Mesh, pspec: PartitionSpec | None,
+    mesh: mesh_lib.Mesh | mesh_lib.AbstractMesh,
+    pspec: PartitionSpec | None,
     memory_kind: str | None = None) -> NamedSharding:
   if pspec is None:
     pspec = PartitionSpec()
@@ -1398,17 +1388,17 @@ def set_mesh(mesh: mesh_lib.Mesh | None) -> mesh_lib.Mesh | None:
   if mesh is not None and not isinstance(mesh, mesh_lib.Mesh):
     raise ValueError(
         f"Expected mesh of type `jax.sharding.Mesh`. Got {type(mesh)}")
+  assert mesh is None or isinstance(mesh, mesh_lib.Mesh)
   if not core.trace_state_clean():
     raise ValueError('`set_mesh` can only be used outside of `jax.jit`.')
 
   if mesh is None:
-    config.abstract_mesh_context_manager.set_global(mesh_lib.empty_abstract_mesh)  # type: ignore
+    config.abstract_mesh_context_manager.set_local(mesh_lib.empty_abstract_mesh)  # type: ignore
   else:
-    config.abstract_mesh_context_manager.set_global(mesh.abstract_mesh)  # type: ignore
+    config.abstract_mesh_context_manager.set_local(mesh.abstract_mesh)  # type: ignore
 
-  prev_mesh = config.device_context.get_global()
-  config.device_context.set_global(mesh)
-  return prev_mesh
+  prev_mesh = config.device_context.swap_local(mesh)
+  return None if prev_mesh is config_ext.unset else prev_mesh
 
 @contextlib.contextmanager
 def use_concrete_mesh(mesh: mesh_lib.Mesh | None):

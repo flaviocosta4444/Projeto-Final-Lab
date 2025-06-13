@@ -964,7 +964,7 @@ def process_camera():
                 # Extrair ângulos do usuário
                 user_angles = extract_angles_from_landmarks(results.pose_landmarks, width, height)
             
-            # Obter valores de referência para a etapa atual
+                # Obter valores de referência para a etapa atual
                 reference_values = get_reference_pose()
             
                 # Calcular pontuação baseada na etapa atual
@@ -972,13 +972,6 @@ def process_camera():
                 
                 # Desenhar feedback na imagem
                 frame = draw_reference_pose(frame, reference_values, user_angles)
-                
-                # Atualizar etapa com base na pontuação
-                if pontuacao > 0.8:  # Se a pontuação for alta o suficiente
-                    tempo_atual = time.time()
-                    if tempo_atual - ultimo_tempo_etapa >= TEMPO_POR_ETAPA:
-                        etapa_atual = (etapa_atual + 1) % len(reference_values)
-                        ultimo_tempo_etapa = tempo_atual
                 
                 # Mostrar pontuação e etapa atual
                 cv2.putText(frame, f"Pontuação: {pontuacao:.2f}", (20, height - 60),

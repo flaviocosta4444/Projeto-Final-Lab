@@ -22,9 +22,10 @@ from jax._src import core
 from jax._src import dispatch
 from jax._src import dtypes
 from jax._src import mesh as mesh_lib
-from jax._src.util import safe_zip
+from jax._src import state
+from jax._src.named_sharding import DuplicateSpecError, NamedSharding
 from jax._src.partition_spec import PartitionSpec as P
-from jax._src.named_sharding import NamedSharding, DuplicateSpecError
+from jax._src.util import safe_zip
 
 zip, unsafe_zip = safe_zip, zip
 
@@ -37,13 +38,14 @@ def _argnum_weak_type(*argnums):
   return lambda *args, **_: all(args[i].weak_type for i in argnums)
 
 def standard_primitive(shape_rule, dtype_rule, name,
-                       weak_type_rule=None, sharding_rule=None, vma_rule=None):
+                       weak_type_rule=None, sharding_rule=None, vma_rule=None,
+                       unreduced_rule=None):
   weak_type_rule = weak_type_rule or _standard_weak_type_rule
   prim = core.Primitive(name)
   prim.def_impl(partial(dispatch.apply_primitive, prim))
   prim.def_abstract_eval(
       partial(standard_abstract_eval, prim, shape_rule, dtype_rule,
-              weak_type_rule, sharding_rule, vma_rule))
+              weak_type_rule, sharding_rule, vma_rule, unreduced_rule))
   return prim
 
 def _get_array_abstraction_level(a): return a.array_abstraction_level
@@ -65,7 +67,7 @@ def _get_abstract_mesh_from_avals(in_avals) -> mesh_lib.AbstractMesh:
   return mesh_lib.empty_abstract_mesh if m is None else m
 
 
-def call_sharding_rule(prim, rule, num_out, *avals, **kwargs):
+def call_sharding_rule(prim, sh_rule, unreduced_rule, num_out, *avals, **kwargs):
   cur_mesh = mesh_lib.get_abstract_mesh()
   aval_mesh = _get_abstract_mesh_from_avals(avals)
   if ((cur_mesh.empty or cur_mesh._are_all_axes_auto_or_manual) and
@@ -73,22 +75,30 @@ def call_sharding_rule(prim, rule, num_out, *avals, **kwargs):
     aval_mesh = cur_mesh if aval_mesh.empty else aval_mesh
     s = NamedSharding(aval_mesh, P())
     return s if num_out is None else [s] * num_out
-  if rule is None:
+  if sh_rule is None:
     raise core.ShardingTypeError(
-        f'sharding rule for {prim.name} is not implemented. Please file a'
-        ' bug at https://github.com/jax-ml/jax/issues. You can work around'
+        f'sharding rule for {prim.name} is not implemented. Please file an'
+        ' issue at https://github.com/jax-ml/jax/issues. You can work around'
         ' this error by dropping that operation into full auto sharding'
         ' mode via: `jax.experimental.shard.auto_axes(fun, out_shardings=...)`')
-  return rule(*avals, **kwargs)
+  out_sharding = sh_rule(*avals, **kwargs)
+  if unreduced_rule is not None:
+    out_sharding = unreduced_rule(out_sharding, *avals, **kwargs)
+  else:
+    if any(a.sharding.spec.unreduced for a in avals):
+      raise NotImplementedError(
+          f'unreduced rule for {prim.name} is not implemented. Please file an'
+          ' issue at https://github.com/jax-ml/jax/issues')
+  return out_sharding
 
 def call_shape_dtype_sharding_rule(prim, shape_rule, dtype_rule, sharding_rule,
-                                   multi_out, *avals, **kwargs):
+                                   unreduced_rule, multi_out, *avals, **kwargs):
   out_shapes = shape_rule(*avals, **kwargs)
   out_dtypes = dtype_rule(*avals, **kwargs)
   num_out = len(out_shapes) if multi_out else None
   try:
     out_shardings = call_sharding_rule(
-        prim, sharding_rule, num_out, *avals, **kwargs)
+        prim, sharding_rule, unreduced_rule, num_out, *avals, **kwargs)
   except DuplicateSpecError as e:
     if multi_out:
       raise
@@ -102,7 +112,19 @@ def call_shape_dtype_sharding_rule(prim, shape_rule, dtype_rule, sharding_rule,
   return out_shapes, out_dtypes, out_shardings
 
 def standard_abstract_eval(prim, shape_rule, dtype_rule, weak_type_rule,
-                           sharding_rule, vma_rule, *avals, **kwargs):
+                           sharding_rule, vma_rule, unreduced_rule,
+                           *avals, **kwargs):
+  for a in avals:
+    if isinstance(a, state.AbstractRef):
+      raise ValueError(
+          f' Attempting to pass a Ref {a} to a primitive:'
+          f' {prim} - did you forget to unpack ([...]) the ref?'
+      )
+    if not isinstance(a, core.UnshapedArray):
+      raise ValueError(
+          f'Attempting to pass an unexpected type {a} to a'
+          f' primitive: {prim}'
+      )
   assert all(isinstance(aval, core.UnshapedArray) for aval in avals), avals
   assert not prim.multiple_results
   weak_type = weak_type_rule(*avals, **kwargs)
@@ -110,7 +132,7 @@ def standard_abstract_eval(prim, shape_rule, dtype_rule, weak_type_rule,
   if least_specialized is core.ShapedArray:
     core.check_avals_context_mesh(avals, prim.name)
     out_shape, out_dtype, out_sharding = call_shape_dtype_sharding_rule(
-        prim, shape_rule, dtype_rule, sharding_rule, False,
+        prim, shape_rule, dtype_rule, sharding_rule, unreduced_rule, False,
         *avals, **kwargs)
     out_vma = vma_rule(*avals, **kwargs)
     out_aval = core.ShapedArray(
@@ -138,7 +160,8 @@ def standard_multi_result_abstract_eval(
   if least_specialized is core.ShapedArray:
     core.check_avals_context_mesh(avals, prim.name)
     out_shapes, out_dtypes, out_shardings = call_shape_dtype_sharding_rule(
-        prim, shape_rule, dtype_rule, sharding_rule, True, *avals, **kwargs)
+        prim, shape_rule, dtype_rule, sharding_rule, None, True,
+        *avals, **kwargs)
     out_vmas = vma_rule(*avals, **kwargs)
     if isinstance(weak_types, bool):
       weak_types = (weak_types,) * len(out_shapes)

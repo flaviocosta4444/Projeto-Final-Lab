@@ -355,6 +355,20 @@ def assert_num_jit_and_pmap_compilations(times):
     raise AssertionError(f"Expected exactly {times} XLA compilations, "
                          f"but executed {count()}")
 
+@contextmanager
+def count_internal_device_puts():
+  if jaxlib_extension_version >= 341:
+    before = jax._src.lib._jax.get_internal_device_put_info()
+  counts = {}
+  try:
+    yield lambda: counts
+  finally:
+    if jaxlib_extension_version >= 341:
+      after = jax._src.lib._jax.get_internal_device_put_info()
+      for k, v in after.items():
+        diff = v - before.get(k, 0)
+        if diff != 0:
+          counts[k] = diff
 
 def jaxlib_version() -> tuple[int, ...]:
   return _jaxlib.version
@@ -370,8 +384,6 @@ def supported_dtypes():
              _dtypes.bfloat16, np.float16, np.float32, np.complex64,
              _dtypes.float8_e4m3fn, _dtypes.float8_e4m3b11fnuz,
              _dtypes.float8_e5m2}
-    if jaxlib_extension_version < 327:
-      types -= {_dtypes.int4, _dtypes.uint4}
   elif device_under_test() == "gpu":
     types = {np.bool_, np.int8, np.int16, np.int32, np.int64,
              np.uint8, np.uint16, np.uint32, np.uint64,
@@ -385,8 +397,6 @@ def supported_dtypes():
              _dtypes.uint4, np.uint8, np.uint16, np.uint32, np.uint64,
              _dtypes.bfloat16, np.float16, np.float32, np.float64,
              np.complex64, np.complex128}
-    if jaxlib_extension_version < 327:
-      types -= {_dtypes.int4, _dtypes.uint4}
   if not config.enable_x64.value:
     types -= {np.uint64, np.int64, np.float64, np.complex128}
   return types
@@ -1420,12 +1430,12 @@ def with_and_without_mesh(f):
       ('Mesh', (('x', 2),), (('i', 'x'),))
     ))(with_mesh_from_kwargs(f))
 
-def with_user_mesh(sizes, names, axis_types=None):
+def with_explicit_mesh(sizes, names, axis_types=None, iota_order=False):
   axis_types = ((mesh_lib.AxisType.Explicit,) * len(names)
                 if axis_types is None else axis_types)
   def decorator(fn):
     def mesh_fn(*args, **kwargs):
-      mesh = create_mesh(sizes, names, axis_types=axis_types)
+      mesh = create_mesh(sizes, names, iota_order, axis_types=axis_types)
       with jax.sharding.use_mesh(mesh):
         return fn(*args, **kwargs, mesh=mesh)
     return mesh_fn

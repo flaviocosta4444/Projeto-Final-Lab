@@ -40,6 +40,7 @@ from jax._src.lib import mosaic_gpu_dialect as dialect  # noqa: F401
 
 # mypy: ignore-errors
 
+WARP_SIZE: int = 32
 WARPGROUP_SIZE: int = 128
 DYNAMIC = -9223372036854775808
 DYNAMIC32 = -2147483648
@@ -64,6 +65,9 @@ WORKGROUP_NVPTX_ADDRESS_SPACE = gpu_address_space_to_nvptx(
 
 
 def ptr_as_memref(ptr, memref_ty: ir.MemRefType, ptr_memory_space: int | None = None):
+  strides, offset = memref_ty.get_strides_and_offset()
+  if offset != 0:
+    raise ValueError("Non-zero offset is not supported for ptr_as_memref")
   i64 = ir.IntegerType.get_signless(64)
   rank = len(memref_ty.shape)
   ptr_ty = "ptr" if ptr_memory_space is None else f"ptr<{ptr_memory_space}>"
@@ -84,7 +88,7 @@ def ptr_as_memref(ptr, memref_ty: ir.MemRefType, ptr_memory_space: int | None = 
       desc = llvm.InsertValueOp(
           desc, llvm.ConstantOp(i64, ir.IntegerAttr.get(i64, s)), [3, i]
       )
-    for i, s in enumerate(get_contiguous_strides(memref_ty.shape)):
+    for i, s in enumerate(strides):
       desc = llvm.InsertValueOp(
           desc, llvm.ConstantOp(i64, ir.IntegerAttr.get(i64, s)), [4, i]
       )
@@ -99,7 +103,7 @@ def pack_array(values):
   ptr_ty = ir.Type.parse("!llvm.ptr")
   arr_ptr = llvm.alloca(ptr_ty, c(len(values), i64), elem_ty)
   for i, v in enumerate(values):
-    elem_ptr = llvm.getelementptr(ptr_ty, arr_ptr, [], [i], elem_ty)
+    elem_ptr = llvm.getelementptr(ptr_ty, arr_ptr, [], [i], elem_ty, llvm.GEPNoWrapFlags.none)
     llvm.store(v, elem_ptr)
   return arr_ptr
 
@@ -507,12 +511,42 @@ def memref_reshape(ref: ir.Value, shape: tuple[int, ...]) -> ir.Value:
         f" allowed) {shape}"
     )
 
-  return _reshape(ref, list(ref_ty.shape), list(shape))
+  src_shape = list(ref_ty.shape)
+  dst_shape = list(shape)
+  if src_shape == dst_shape:
+    return ref
+  if not src_shape:
+    _, offset = ref_ty.get_strides_and_offset()
+    identity = ir.AffineMapAttr.get(ir.AffineMap.get_identity(0))
+    if ref_ty.layout == identity:
+      new_layout = ir.AffineMapAttr.get(ir.AffineMap.get_identity(len(dst_shape)))
+    else:
+      new_layout = ir.StridedLayoutAttr.get(offset, [1] * len(dst_shape))
+    result_ty = ir.MemRefType.get(dst_shape, ref_ty.element_type, new_layout, ref_ty.memory_space)
+    return memref.expand_shape(result_ty, ref, [], [], dst_shape)
+  if not dst_shape:
+    _, offset = ref_ty.get_strides_and_offset()
+    identity = ir.AffineMapAttr.get(ir.AffineMap.get_identity(ref_ty.rank))
+    contig_strided_1d = ir.Attribute.parse("strided<[1]>")
+    if ref_ty.layout == identity or ref_ty.layout == contig_strided_1d:
+      new_layout = ir.AffineMapAttr.get(ir.AffineMap.get_identity(0))
+    else:
+      new_layout = ir.StridedLayoutAttr.get(offset, [])
+    result_ty = ir.MemRefType.get((), ref_ty.element_type, new_layout, ref_ty.memory_space)
+    return memref.collapse_shape(result_ty, ref, [])
+  return _reshape(ref, src_shape, dst_shape)
 
 
 def memref_fold(ref: ir.Value, dim, fold_rank) -> ir.Value:
   ref_ty = ir.MemRefType(ref.type)
   new_shape = list(ref_ty.shape)
+  if dim < 0:
+    raise ValueError(f"Dimension {dim} is negative")
+  if dim + fold_rank > len(new_shape):
+    raise ValueError(
+        f"Folding {fold_rank} dimensions starting from {dim} is out of bounds"
+        f" for shape {new_shape}"
+    )
   new_shape[dim : dim + fold_rank] = [np.prod(new_shape[dim : dim + fold_rank])]
   identity = ir.AffineMapAttr.get(ir.AffineMap.get_identity(ref_ty.rank))
   contig_strided_1d = ir.Attribute.parse("strided<[1]>")
@@ -721,7 +755,7 @@ class BarrierRef:
     with single_thread(scope=ThreadSubset.BLOCK):
       for i in range(num_barriers):
         nvvm.mbarrier_init_shared(
-            llvm.getelementptr(ptr, address, [], [i], i64),
+            llvm.getelementptr(ptr, address, [], [i], i64, llvm.GEPNoWrapFlags.none),
             c(arrival_count, i32),
         )
     return BarrierRef(address, c(0, i32), phases, num_barriers)
@@ -793,11 +827,70 @@ class BarrierRef:
     i64 = ir.IntegerType.get_signless(64)
     DYNAMIC32 = -2147483648
     return llvm.getelementptr(
-        ptr, self.base_address, [self.offset], [DYNAMIC32], i64
+        ptr, self.base_address, [self.offset], [DYNAMIC32], i64, llvm.GEPNoWrapFlags.none
     )
 
-  def as_dialect_barrier_memref(self) -> ir.Value:
-    shape = () if self.num_barriers == 1 else (self.num_barriers,)
+
+@dataclasses.dataclass(frozen=True)
+class DialectBarrierRef:
+  barrier_ref: BarrierRef
+
+  @staticmethod
+  def initialize(
+      address: ir.Value,
+      num_barriers: int,
+      arrival_count: int = 1,
+  ) -> "DialectBarrierRef":
+    if num_barriers > 32:
+      raise NotImplementedError("Only up to 32 barriers per group supported")
+
+    barrier_ty = ir.MemRefType.get(
+        (num_barriers,), ir.Type.parse("!mosaic_gpu.barrier")
+    )
+    dialect.InitializeBarrierOp(
+        barrier_ty, base_pointer=address, arrival_count=arrival_count
+    )
+
+    i32 = ir.IntegerType.get_signless(32)
+    phases = memref.alloca(ir.MemRefType.get((), i32), [], [])
+    memref.store(c(0, i32), phases, [])
+    return DialectBarrierRef(
+        barrier_ref=BarrierRef(address, c(0, i32), phases, num_barriers)
+    )
+
+  def __iter__(self) -> Iterator["DialectBarrierRef"]:
+    if self.barrier_ref.num_barriers == 1:
+      yield self
+    else:
+      for offset in range(self.barrier_ref.num_barriers):
+        yield self[offset]
+
+  def __getitem__(self, offset: ir.Value | int) -> "DialectBarrierRef":
+    return DialectBarrierRef(self.barrier_ref[offset])
+
+  def wait_parity(self, parity, for_tensor_core=False):
+    self.barrier_ref.wait_parity(parity, for_tensor_core)
+
+  def wait(self, for_tensor_core: bool = False):
+    assert self.barrier_ref.phases is not None
+    self.barrier_ref.wait(for_tensor_core)
+
+  def update_parities(self, parities: ir.Value) -> tuple[ir.Value, ir.Value]:
+    return self.barrier_ref.update_parities(parities)
+
+  def arrive(self):
+    self.barrier_ref.arrive()
+
+  def arrive_expect_tx(self, bytes: int | ir.Value):
+    dialect.ArriveExpectTxOp(
+        barrier=self.as_barrier_memref(), expect_tx=bytes)
+
+  def get_ptr(self):
+    return self.barrier_ref.get_ptr()
+
+  def as_barrier_memref(self) -> ir.Value:
+    num_barriers = self.barrier_ref.num_barriers
+    shape = () if num_barriers == 1 else (num_barriers,)
     return ptr_as_memref(
         self.get_ptr(),
         ir.MemRefType.get(shape, ir.Type.parse("!mosaic_gpu.barrier")),
@@ -805,8 +898,8 @@ class BarrierRef:
     )
 
   @classmethod
-  def from_dialect_barrier_memref(cls, barrier: ir.Value):
-    """Creates a BarrierRef from a memref of a dialect barrier."""
+  def from_barrier_memref(cls, barrier: ir.Value):
+    """Creates a DialectBarrierRef from a memref of a dialect barrier."""
     memref_type = ir.MemRefType(barrier.type)
     if memref_type.rank > 1 or memref_type.element_type != ir.Type.parse(
         "!mosaic_gpu.barrier"
@@ -817,14 +910,15 @@ class BarrierRef:
       )
 
     return cls(
-        base_address=memref_ptr(
-            barrier, memory_space=WORKGROUP_NVPTX_ADDRESS_SPACE
-        ),
-        offset=c(0, ir.IntegerType.get_signless(64)),
-        phases=None,
-        num_barriers=(1 if memref_type.rank == 0 else memref_type.shape[0]),
+        barrier_ref=BarrierRef(
+            base_address=memref_ptr(
+                barrier, memory_space=WORKGROUP_NVPTX_ADDRESS_SPACE
+            ),
+            offset=c(0, ir.IntegerType.get_signless(64)),
+            phases=None,
+            num_barriers=(1 if memref_type.rank == 0 else memref_type.shape[0]),
+        )
     )
-
 
 @dataclasses.dataclass(frozen=True)
 class CollectiveBarrierRef:
@@ -1181,7 +1275,7 @@ def getelementptr(
 ) -> ir.Value:
   static_indices = [i if isinstance(i, int) else DYNAMIC32 for i in indices]
   dyn_indices = [i for i in indices if not isinstance(i, int)]
-  return llvm.getelementptr(ptr.type, ptr, dyn_indices, static_indices, dtype)
+  return llvm.getelementptr(ptr.type, ptr, dyn_indices, static_indices, dtype, llvm.GEPNoWrapFlags.none)
 
 
 def dyn_dot(x, y):
@@ -1191,13 +1285,24 @@ def dyn_dot(x, y):
 
 def shfl_bfly(x: ir.Value, distance: int | ir.Value):
   i32 = ir.IntegerType.get_signless(32)
+  index = ir.IndexType.get()
   if isinstance(distance, int):
     distance = c(distance, i32)
   if (result_type := x.type) != i32:
+    if (x_bitwidth := bitwidth(x.type)) < 32:  # Pad to 32-bits if necessary.
+      x = bitcast(x, ir.IntegerType.get_signless(x_bitwidth))
+      empty32 = llvm.mlir_undef(ir.VectorType.get((32 // x_bitwidth,), x.type))
+      x = vector.insertelement(x, empty32, position=c(0, index))
+    elif x_bitwidth != 32:
+      raise ValueError(f"Unsupported bitwidth {x_bitwidth}")
     x = bitcast(x, i32)
   y = nvvm.shfl_sync(
       i32, c(0xFFFFFFFF, i32), x, distance, c(0x1F, i32), nvvm.ShflKind.bfly,
   )
+  if (x_bitwidth := bitwidth(result_type)) < 32:
+    bits_ty = ir.IntegerType.get_signless(x_bitwidth)
+    y_vec = bitcast(y, ir.VectorType.get((32 // x_bitwidth,), x.type))
+    y = vector.extractelement(y_vec, position=c(0, index))
   return bitcast(y, result_type)
 
 
@@ -1220,6 +1325,11 @@ def prmt(high: ir.Value, low: ir.Value, permutation: ir.Value):
 def bitcast(x: ir.Value, new_type: ir.Type):
   if x.type == new_type:
     return x
+  if (x_bw := bitwidth(x.type)) != (new_bw := bitwidth(new_type)):
+    raise ValueError(
+        f"Can't bitcast {x.type} (of bitwidth {x_bw}) to {new_type} (of"
+        f" bitwidth {new_bw})"
+    )
   if ir.VectorType.isinstance(x.type) and ir.IntegerType.isinstance(new_type):
     new_type = ir.IntegerType(new_type)
     x_ty = ir.VectorType(x.type)
@@ -1239,6 +1349,12 @@ def bitcast(x: ir.Value, new_type: ir.Type):
     if bitwidth(x_ty) != bitwidth(new_ty):
       raise ValueError(f"Can't bitcast {x.type} to {new_type}")
     return vector.bitcast(new_type, x)
+  if ir.IntegerType.isinstance(x.type) and ir.FloatType.isinstance(new_type):
+    return arith.bitcast(new_type, x)
+  if ir.FloatType.isinstance(x.type) and ir.IntegerType.isinstance(new_type):
+    return arith.bitcast(new_type, x)
+  if ir.FloatType.isinstance(x.type) and ir.FloatType.isinstance(new_type):
+    return arith.bitcast(new_type, x)
   raise ValueError(f"Can't bitcast {x.type} to {new_type}")
 
 

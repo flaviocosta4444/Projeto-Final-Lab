@@ -2507,10 +2507,6 @@ def dot_general(lhs: ArrayLike, rhs: ArrayLike, dimension_numbers: DotDimensionN
     by the ``lhs`` non-contracting/non-batch dimensions, and finally the ``rhs``
     non-contracting/non-batch dimensions.
   """
-  if out_sharding is not None and not isinstance(out_sharding, NamedSharding):
-    raise NotImplementedError(
-        '`out_sharding` argument of `dot_general` only supports NamedSharding '
-        'instances. Please file a bug if this is not enough for your use case.')
   out_sharding = canonicalize_sharding(out_sharding, 'dot_general')
   (lhs_contract, rhs_contract), (lhs_batch, rhs_batch) = dimension_numbers
   cdims = (api_util._ensure_index_tuple(lhs_contract),
@@ -2709,6 +2705,7 @@ def broadcast_in_dim(operand: ArrayLike, shape: Shape,
   See Also:
     jax.lax.broadcast : simpler interface to add new leading dimensions.
   """
+  # TODO(dfm): Re-write this as a "reshard" when only the sharding changes.
   out_sharding = canonicalize_sharding(out_sharding, 'broadcast_in_dim')
   if (np.ndim(operand) == len(shape) and not len(broadcast_dimensions) and
       isinstance(operand, Array) and out_sharding is None):
@@ -2964,6 +2961,8 @@ def reduce(operands: Any,
     flat_init_avals = safe_map(core.get_aval, flat_init_values)
     closed_jaxpr, out_tree = _variadic_reduction_jaxpr(
         computation, comp_debug, tuple(flat_init_avals), init_value_tree)
+    flat_operands = core.standard_insert_pvary(*flat_operands)
+    flat_init_avals = core.standard_insert_pvary(*flat_init_values)
     out = reduce_p.bind(*flat_operands, *flat_init_values, computation=computation,
                         jaxpr=closed_jaxpr, dimensions=tuple(dimensions))
     return tree_util.tree_unflatten(out_tree, out)
@@ -3955,7 +3954,7 @@ def broadcasting_sharding_rule(name, *avals):
 
   result_specs = [None] * len(shapes[0])
   for i, (ss, ds) in enumerate(zip(zip(*specs), zip(*shapes))):
-    if all(s == ss[0] for s in ss[1:]):
+    if all(ss[0] == s for s in ss[1:]):
       # if all dimension shardings are same, the resulting dimension sharding is
       # the same.
       result_specs[i] = ss[0]
@@ -3978,7 +3977,7 @@ def broadcasting_sharding_rule(name, *avals):
   return NamedSharding(mesh, P(*result_specs))
 
 def naryop(result_dtype, accepted_dtypes, name, allow_extended_dtype=False,
-           require_same_dtypes=True):
+           require_same_dtypes=True, unreduced_rule=None):
   dtype_rule = partial(naryop_dtype_rule, result_dtype, accepted_dtypes, name,
                        allow_extended_dtype=allow_extended_dtype,
                        require_same=require_same_dtypes)
@@ -3986,7 +3985,8 @@ def naryop(result_dtype, accepted_dtypes, name, allow_extended_dtype=False,
   sharding_rule = partial(broadcasting_sharding_rule, name)
   prim = standard_primitive(
       shape_rule, dtype_rule, name, sharding_rule=sharding_rule,
-      vma_rule=partial(core.standard_vma_rule, name))
+      vma_rule=partial(core.standard_vma_rule, name),
+      unreduced_rule=unreduced_rule)
   batching.defbroadcasting(prim)
   pe.def_trivial_padding(prim)
   return prim
@@ -4574,8 +4574,30 @@ def _add_transpose(t, x, y):
   else:
     return [_unbroadcast(x_aval, t), _unbroadcast(y_aval, t)]
 
-# TODO(slebedev): Why does mypy fail to infer the type here?
-add_p: Primitive = standard_naryop([_num, _num], 'add')
+def _add_unreduced(out_sharding, x, y):
+  x_ur, y_ur = x.sharding.spec.unreduced, y.sharding.spec.unreduced
+  if x_ur and y_ur:
+    if x_ur != y_ur:
+      raise core.ShardingTypeError(
+          'lhs and rhs to `add` must be unreduced along the same mesh axes. '
+          f'Got lhs={x_ur}, rhs={y_ur}')
+    res_unreduced = x_ur
+  elif x_ur or y_ur:
+    if x_ur and not y_ur:
+      lhs_str, rhs_str = 'lhs', 'rhs'
+    else:
+      assert not x_ur and y_ur
+      lhs_str, rhs_str = 'rhs', 'lhs'
+    raise core.ShardingTypeError(
+        f'{lhs_str} is unreduced while {rhs_str} is not. `add` operation does'
+        ' not allow this because there will be implicit communication. Please'
+        f' reduce {lhs_str} via `reshard` before calling `add`.')
+  else:
+    res_unreduced = None
+  return out_sharding.with_spec(out_sharding.spec.with_unreduced(res_unreduced))
+
+add_p: Primitive = naryop(_input_dtype, [_num, _num], 'add',
+                          unreduced_rule=_add_unreduced)
 ad.primitive_jvps[add_p] = _add_jvp
 ad.primitive_transposes[add_p] = _add_transpose
 mlir.register_lowering(add_p, partial(_nary_lower_hlo, hlo.add))
@@ -4852,11 +4874,11 @@ def _convert_elt_type_folding_rule(consts, eqn):
 
 def _convert_elt_type_fwd_rule(eqn):
   v, = eqn.invars
-  if (not dtypes.issubdtype(eqn.params['new_dtype'], dtypes.extended) and
+  if (v.aval.dtype == eqn.params['new_dtype'] and
+      v.aval.weak_type == eqn.params['weak_type'] and
       not dtypes.issubdtype(v.aval.dtype, dtypes.extended) and
-      v.aval.dtype == eqn.params['new_dtype'] and
-      v.aval.weak_type == eqn.params['weak_type']):
-    return [v], None
+      (eqn.params['sharding'] is None or eqn.params['sharding'] == v.aval.sharding)):
+    return [0], None
   else:
     return [None], eqn
 
@@ -4885,10 +4907,20 @@ convert_element_type_p.def_abstract_eval(
             _convert_element_type_shape_rule, _convert_element_type_dtype_rule,
             _convert_element_type_weak_type_rule,
             _convert_element_type_sharding_rule,
-            partial(core.standard_vma_rule, convert_element_type_p.name)))
+            partial(core.standard_vma_rule, convert_element_type_p.name),
+            None))
 ad.defjvp2(convert_element_type_p, _convert_element_type_jvp_rule)
 ad.primitive_transposes[convert_element_type_p] = _convert_element_type_transpose_rule
-batching.defvectorized(convert_element_type_p)
+
+def _convert_element_type_batching_rule(
+    axis_data, batched_args, batch_dims, *, new_dtype, weak_type, sharding):
+  if sharding is not None:
+    sharding = batching.get_sharding_for_vmap(axis_data, sharding, 0)
+  new_params = dict(new_dtype=new_dtype, weak_type=weak_type, sharding=sharding)
+  return convert_element_type_p.bind(*batched_args, **new_params), batch_dims[0]
+batching.fancy_primitive_batchers[convert_element_type_p] = _convert_element_type_batching_rule
+batching.skippable_batchers[convert_element_type_p] = lambda _: ()
+
 pe.const_fold_rules[convert_element_type_p] = _convert_elt_type_folding_rule
 pe.forwarding_rules[convert_element_type_p] = _convert_elt_type_fwd_rule
 pe.def_trivial_padding(convert_element_type_p)
@@ -5161,7 +5193,7 @@ def _dot_general_shape_computation(lhs_shape, rhs_shape, dimension_numbers):
   lhs_tensored_shape = tuple_delete(lhs_shape, lhs_contract_or_batch)
   rhs_group = ()
   if isinstance(dimension_numbers, RaggedDotDimensionNumbers):
-    rhs_group = tuple(dimension_numbers.rhs_group_dimensions)
+    rhs_group = tuple(dimension_numbers.rhs_group_dimensions)  # pytype: disable=attribute-error
   rhs_contract_or_batch_or_group = tuple(
       sorted(tuple(rhs_contracting) + tuple(rhs_batch) + rhs_group)
   )
@@ -5182,11 +5214,26 @@ def _dot_general_sharding_rule(lhs, rhs, *, dimension_numbers, precision,
         'Mesh of both lhs and rhs should match. Got lhs:'
         f' {lhs.sharding.mesh} and rhs: {rhs.sharding.mesh}')
 
+  (lhs_contracting, rhs_contracting), (lhs_batch, rhs_batch) = dimension_numbers
+  lhs_contracting_spec = tuple(lhs.sharding.spec[i] for i in lhs_contracting)
+  rhs_contracting_spec = tuple(rhs.sharding.spec[i] for i in rhs_contracting)
+
   if out_sharding is not None:
     assert isinstance(out_sharding, NamedSharding)
+    if out_sharding.spec.unreduced:
+      if lhs_contracting_spec != rhs_contracting_spec:
+        raise core.ShardingTypeError(
+            'lhs and rhs contracting dims should be sharded identically when'
+            ' out_sharding provided to dot_general mentions unreduced_axes.'
+            f' Got {out_sharding=}, {lhs_contracting_spec=},'
+            f' {rhs_contracting_spec=}')
+      if out_sharding.spec.unreduced != lhs_contracting_spec:
+        raise core.ShardingTypeError(
+            "out_sharding's unreduced axes should be equal to the contracting"
+            f' specs. Got unreduced axes={out_sharding.spec.unreduced} and'
+            f' contracting spec={lhs_contracting_spec}')
     return out_sharding
 
-  (lhs_contracting, rhs_contracting), (lhs_batch, rhs_batch) = dimension_numbers
   lhs_batch_spec = tuple(lhs.sharding.spec[i] for i in lhs_batch)
   rhs_batch_spec = tuple(rhs.sharding.spec[i] for i in rhs_batch)
   msg = ("dot_general requires lhs batch dimensions and rhs batch dimensions "
@@ -5194,8 +5241,6 @@ def _dot_general_sharding_rule(lhs, rhs, *, dimension_numbers, precision,
         f"{rhs_batch_spec}.")
   _check_specs_match(lhs_batch_spec, rhs_batch_spec, msg)
 
-  lhs_contracting_spec = tuple(lhs.sharding.spec[i] for i in lhs_contracting)
-  rhs_contracting_spec = tuple(rhs.sharding.spec[i] for i in rhs_contracting)
   msg = ("dot_general requires contracting dimensions to have consistent "
         f"sharding, got {lhs_contracting_spec} and {rhs_contracting_spec}.")
   _check_specs_match(lhs_contracting_spec, rhs_contracting_spec, msg)
@@ -6006,7 +6051,7 @@ def _ragged_dot_general_transpose_rule(
         unsorted_axes = list(x_batch) + x_kept + x_contract_sorted_by_y
       case RaggedDotMode.RAGGED_CONTRACTING | RaggedDotMode.RAGGED_BATCH:
         raise unimplemented('grad_x_dims', mode)
-    return dims, unsorted_axes
+    return dims, unsorted_axes  # pytype: disable=name-error
 
   def grad_y_dims():
     match mode:
@@ -6025,7 +6070,7 @@ def _ragged_dot_general_transpose_rule(
         )
       case RaggedDotMode.RAGGED_CONTRACTING | RaggedDotMode.RAGGED_BATCH:
         raise unimplemented('grad_y_dims', mode)
-    return dims, unsorted_axes
+    return dims, unsorted_axes  # pytype: disable=name-error
 
   def _ragged_dot_grad(lhs, rhs, dims_fn, aval):
     dims, unsorted_axes = dims_fn()
@@ -6227,7 +6272,7 @@ def _ragged_dot_general_impl(
           lhs,
           rhs,
           dimension_numbers=ragged_dot_dimension_numbers.dot_dimension_numbers,
-      )
+      )  # pytype: disable=bad-return-type
 
 
 def _ragged_dot_general_lower(
@@ -6440,8 +6485,10 @@ def _broadcast_in_dim_batch_rule(axis_data, batched_args, batch_dims, shape,
 
 def _broadcast_in_dim_fwd_rule(eqn):
   v, *dyn = eqn.invars
-  if not dyn and core.definitely_equal_shape(eqn.params['shape'], v.aval.shape):
-    return [v], None
+  if (not dyn and core.definitely_equal_shape(eqn.params['shape'], v.aval.shape)
+      and (eqn.params['sharding'] is None or
+           eqn.params['sharding'] == v.aval.sharding)):
+    return [0], None
   else:
     return [None], eqn
 
@@ -7023,6 +7070,8 @@ def _merge_on_one_axis(operand, new_sizes):
 def _reshape_sharding_rule(operand, *, new_sizes, dimensions, sharding):
   if sharding is not None:
     return sharding
+  if operand.sharding.is_fully_replicated:
+    return operand.sharding
   non_1s_op_shape = [s for s in operand.shape if s != 1]
   non_1s_new_shape = [s for s in new_sizes if s != 1]
   if non_1s_op_shape == non_1s_new_shape:
@@ -7323,7 +7372,7 @@ def _select_transpose_rule(t, which, *cases):
           if ad.is_undefined_primal(case) else None for i, case in enumerate(cases)
       ]
 
-def _select_batch_rule(batched_args, batch_dims, **unused_kwargs):
+def _select_batch_rule(axis_data, batched_args, batch_dims, **unused_kwargs):
   which, *cases = batched_args
   which_bdim, *case_bdims = batch_dims
   size = next(x.shape[i] for x, i in zip(batched_args, batch_dims)
@@ -7336,7 +7385,8 @@ def _select_batch_rule(batched_args, batch_dims, **unused_kwargs):
     else:
       # vmapped function had a scalar which with nonscalar args
       assert np.ndim(which) == 1
-      which = broadcast_in_dim(which, cases[0].shape, [which_bdim])
+      which = broadcast_in_dim(which, cases[0].shape, [which_bdim],
+                               out_sharding=core.typeof(cases[0]).sharding)
       return select_n(which, *cases), which_bdim
   elif np.ndim(which) == 0 and all(bdim is not None for bdim in case_bdims):
     if all(case_bdims[0] == bdim for bdim in case_bdims[1:]):
@@ -7347,16 +7397,18 @@ def _select_batch_rule(batched_args, batch_dims, **unused_kwargs):
                      for c, c_bdim in zip(cases[1:], case_bdims[1:])]
       return select_n(which, cases[0], *other_cases), bdim
 
-  which = (batching.bdim_at_front(which, which_bdim, size) if np.shape(which)
-           else which)
+  which = (batching.bdim_at_front(which, which_bdim, size,
+                                  axis_data.explicit_mesh_axis)
+           if np.shape(which) else which)
   if not all(() == np.shape(c) for c in cases):
-    cases = [batching.bdim_at_front(c, bdim, size)
+    cases = [batching.bdim_at_front(c, bdim, size, axis_data.explicit_mesh_axis)
              for c, bdim in zip(cases, case_bdims)]
   assert all(np.shape(cases[0]) == np.shape(c) for c in cases[1:])
   if 0 < np.ndim(which) < np.ndim(cases[0]):
     # vmapped function had a scalar which with nonscalar args
     assert np.ndim(which) == 1
-    which = broadcast_in_dim(which, cases[0].shape, [0])
+    which = broadcast_in_dim(which, cases[0].shape, [0],
+                             out_sharding=core.typeof(cases[0]).sharding)
   if np.ndim(which) > np.ndim(cases[0]):
     assert np.ndim(cases[0]) == 0
     cases = [broadcast(c, which.shape) for c in cases]
@@ -7440,7 +7492,8 @@ select_n_p = standard_primitive(
     vma_rule=partial(core.standard_vma_rule, 'select_n'))
 ad.primitive_jvps[select_n_p] = _select_jvp
 ad.primitive_transposes[select_n_p] = _select_transpose_rule
-batching.primitive_batchers[select_n_p] = _select_batch_rule
+batching.fancy_primitive_batchers[select_n_p] = _select_batch_rule
+batching.skippable_batchers[select_n_p] = lambda _: ()
 mlir.register_lowering(select_n_p, _select_hlo_lowering)
 pe.def_trivial_padding(select_n_p)
 
@@ -8740,15 +8793,19 @@ _zeros: Callable = partial(full_like, fill_value=0)
 
 def _zero(x):
   x_aval = core.get_aval(x)
-  return full_like(x, shape=(), fill_value=0,
-                   sharding=x_aval.sharding.with_spec(P()))
+  out = full_like(x, shape=(), fill_value=0,
+                  sharding=x_aval.sharding.with_spec(P()))
+  out = core.pvary(out, tuple(x_aval.vma))
+  return out
 
 _ones: Callable = partial(full_like, fill_value=1)
 
 def _one(x):
   x_aval = core.get_aval(x)
-  return full_like(x, shape=(), fill_value=1,
-                    sharding=x_aval.sharding.with_spec(P()))
+  out = full_like(x, shape=(), fill_value=1,
+                  sharding=x_aval.sharding.with_spec(P()))
+  out = core.pvary(out, tuple(x_aval.vma))
+  return out
 
 _twos: Callable = partial(full_like, fill_value=2)
 _two: Callable = partial(full_like, shape=(), fill_value=2)

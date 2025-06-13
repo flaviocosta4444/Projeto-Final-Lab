@@ -48,7 +48,7 @@ from jax._src.lib import gpu_linalg
 from jax._src.lib import gpu_solver
 from jax._src.lib import gpu_sparse
 from jax._src.lib import lapack
-from jax._src.lib import version as jaxlib_version
+from jax._src.lib import version as jaxlib_version, jaxlib_extension_version
 from jax._src.lib.mlir import ir
 from jax._src.lib.mlir.dialects import chlo
 from jax._src.lib.mlir.dialects import hlo
@@ -780,7 +780,8 @@ def linalg_primitive(result_dtype, accepted_dtypes, ranks, result_shape, name,
     prim.def_abstract_eval(
       partial(lax_utils.standard_abstract_eval, prim, shape_rule, dtype_rule,
               lax_utils._standard_weak_type_rule, sharding_rule,
-              partial(core.standard_vma_rule, name)))
+              partial(core.standard_vma_rule, name),
+              None))
   if supports_batching:
     batching.primitive_batchers[prim] = partial(
         batching.expand_dims_batcher, prim)
@@ -2529,29 +2530,33 @@ def _tridiagonal_solve_shape_rule(dl_shape, d_shape, du_shape, b_shape, **_):
   return b_shape
 
 def _tridiagonal_solve_gpu_lowering(ctx, dl, d, du, b, *, target_name_prefix):
-  _, _, _, b_aval = ctx.avals_in
-  *batch_dims, m, n = b_aval.shape
-  batch_size = math.prod(batch_dims)
+  if jaxlib_extension_version < 340:
+    _, _, _, b_aval = ctx.avals_in
+    *batch_dims, m, n = b_aval.shape
+    batch_size = math.prod(batch_dims)
+    mod = gpu_sparse._cusparse if target_name_prefix == "cu" else gpu_sparse._hipsparse
+    assert mod is not None
+    opaque = mod.build_gtsv2_descriptor(batch_size, m, n, m)
+    if b_aval.dtype == np.float32:
+      buffer_size = mod.gtsv2_f32_buffer_size(m, n, m)
+      target_name = "sparse_gtsv2_f32_ffi"
+    elif b_aval.dtype == np.float64:
+      buffer_size = mod.gtsv2_f64_buffer_size(m, n, m)
+      target_name = "sparse_gtsv2_f64_ffi"
+    else:
+      raise NotImplementedError(
+          "tridiagonal_solve is only implemented for float32 and float64 on GPU.")
 
-  mod = gpu_sparse._cusparse if target_name_prefix == "cu" else gpu_sparse._hipsparse
-  assert mod is not None
-  opaque = mod.build_gtsv2_descriptor(batch_size, m, n, m)
-  if b_aval.dtype == np.float32:
-    buffer_size = mod.gtsv2_f32_buffer_size(m, n, m)
-    target_name = "sparse_gtsv2_f32_ffi"
-  elif b_aval.dtype == np.float64:
-    buffer_size = mod.gtsv2_f64_buffer_size(m, n, m)
-    target_name = "sparse_gtsv2_f64_ffi"
-  else:
-    raise NotImplementedError(
-        "tridiagonal_solve is only implemented for float32 and float64 on GPU.")
+    buffer_aval = core.ShapedArray(shape=(buffer_size,), dtype=np.int8)
+    sub_ctx = ctx.replace(avals_out=[*ctx.avals_out, buffer_aval])
+    rule = _linalg_ffi_lowering(
+        f"{target_name_prefix}{target_name}", operand_output_aliases={3: 0},
+        batch_partitionable=False)
+    return rule(sub_ctx, dl, d, du, b, opaque=opaque)[:1]
 
-  buffer_aval = core.ShapedArray(shape=(buffer_size,), dtype=np.int8)
-  sub_ctx = ctx.replace(avals_out=[*ctx.avals_out, buffer_aval])
-  rule = _linalg_ffi_lowering(
-      f"{target_name_prefix}{target_name}", operand_output_aliases={3: 0},
-      batch_partitionable=False)
-  return rule(sub_ctx, dl, d, du, b, opaque=opaque)[:1]
+  target_name = f"{target_name_prefix}sparse_gtsv2_ffi"
+  rule = _linalg_ffi_lowering(target_name, operand_output_aliases={3: 0})
+  return rule(ctx, dl, d, du, b)
 
 def _tridiagonal_solve_cpu_lowering(ctx, dl, d, du, b, **kwargs):
   del kwargs  # unused
@@ -2794,9 +2799,9 @@ def _column_major_matrix_layout(dim: int) -> tuple[int, ...]:
   return (dim - 2, dim - 1) + tuple(range(dim - 3, -1, -1))
 
 def _sdy_rule_for_aval(letters, num_batch_dims, aval):
-  return " ".join(
-      ("...", *(next(letters) for _ in range(len(aval.shape) - num_batch_dims)))
-  )
+  d = len(aval.shape) - num_batch_dims
+  preffix = "... " if num_batch_dims and d >= 0 else ""
+  return preffix + " ".join(next(letters) for _ in range(d))
 
 def _build_sdy_sharding_rule(num_batch_dims, avals_in, avals_out):
   letters = iter(string.ascii_letters)

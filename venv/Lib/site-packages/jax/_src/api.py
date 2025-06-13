@@ -358,7 +358,7 @@ def disable_jit(disable: bool = True):
   ...   return y + 3
   ...
   >>> print(f(jax.numpy.array([1, 2, 3])))  # doctest:+ELLIPSIS
-  Value of y is Traced<ShapedArray(int32[3])>with<DynamicJaxprTrace...>
+  Value of y is Traced<int32[3]>with<DynamicJaxprTrace...>
   [5 7 9]
 
   Here ``y`` has been abstracted by :py:func:`jit` to a :py:class:`ShapedArray`,
@@ -540,17 +540,18 @@ def _check_input_dtype_revderiv(name, holomorphic, allow_int, x):
     if not dtypes.issubdtype(aval.dtype, np.complexfloating):
       raise TypeError(f"{name} with holomorphic=True requires inputs with complex dtype, "
                       f"but got {aval.dtype.name}.")
-  if (dtypes.issubdtype(aval.dtype, dtypes.extended) or
-      dtypes.issubdtype(aval.dtype, np.integer) or
-      dtypes.issubdtype(aval.dtype, np.bool_)):
-    if not allow_int:
-      raise TypeError(f"{name} requires real- or complex-valued inputs (input dtype "
-                      f"that is a sub-dtype of np.inexact), but got {aval.dtype.name}. "
-                      "If you want to use Boolean- or integer-valued inputs, use vjp "
-                      "or set allow_int to True.")
-  elif not dtypes.issubdtype(aval.dtype, np.inexact):
-    raise TypeError(f"{name} requires numerical-valued inputs (input dtype that is a "
-                    f"sub-dtype of np.bool_ or np.number), but got {aval.dtype.name}.")
+  if isinstance(aval, ShapedArray):
+    if (dtypes.issubdtype(aval.dtype, dtypes.extended) or
+        dtypes.issubdtype(aval.dtype, np.integer) or
+        dtypes.issubdtype(aval.dtype, np.bool_)):
+      if not allow_int:
+        raise TypeError(f"{name} requires real- or complex-valued inputs (input dtype "
+                        f"that is a sub-dtype of np.inexact), but got {aval.dtype.name}. "
+                        "If you want to use Boolean- or integer-valued inputs, use vjp "
+                        "or set allow_int to True.")
+    elif not dtypes.issubdtype(aval.dtype, np.inexact):
+      raise TypeError(f"{name} requires numerical-valued inputs (input dtype that is a "
+                      f"sub-dtype of np.bool_ or np.number), but got {aval.dtype.name}.")
 _check_input_dtype_grad = partial(_check_input_dtype_revderiv, "grad")
 
 def _check_output_dtype_revderiv(name, holomorphic, x):
@@ -574,6 +575,79 @@ def _check_output_dtype_revderiv(name, holomorphic, x):
                     "For differentiation of functions with integer outputs, use "
                     "jax.vjp directly.")
 _check_output_dtype_grad = partial(_check_output_dtype_revderiv, "grad")
+
+def fwd_and_bwd(
+    fun: Callable, argnums: int | Sequence[int], has_aux: bool = False,
+    jitted: bool = True,
+) -> tuple[Callable, Callable]:
+  """Creates functions ``fwd`` and ``bwd`` corresponding to the forward and
+  backward pass of a given function ``fun``. The forward function ``fwd(*args)``
+  functionally behaves much like ``y, fun_vjp = jax.vjp(fun, *args)``, but allows
+  reuse of the backward function ``bwd`` across multiple iterations, which is
+  useful to avoid recompilation when the forward and backward do not end up in a
+  single jitted function:
+
+  >>> import jax
+  >>>
+  >>> x = W = cot_out = jax.numpy.ones((4,4))
+  >>>
+  >>> def f(x, W):
+  ...     return x @ W
+  ...
+  >>> f_jitted = jax.jit(f)
+  >>> for i in range(3):
+  ...     y, f_vjp = jax.vjp(f_jitted, x, W)
+  ...     cot_x, cot_W = f_vjp(cot_out)           # not jitted
+  ...     cot_x, cot_W = jax.jit(f_vjp)(cot_out)  # recompiles on every iteration
+  ...
+  >>> fwd, bwd = jax.fwd_and_bwd(f, argnums=(0,1))
+  >>> for i in range(3):
+  ...     y, residuals = fwd(x, W)
+  ...     cot_x, cot_W = bwd(residuals, cot_out)  # jitted, compiles once
+  ...
+
+  Args:
+    fun: Function to produce a forward and backward of.
+    argnums: Integer or sequence of integers. Specifies which positional argument(s)
+      to differentiate with respect to.
+    has_aux: Optional, bool. Indicates whether ``fun`` returns a pair where the
+     first element is considered the output of the mathematical function to be
+     differentiated and the second element is auxiliary data. Default False.
+    jitted: Optional, bool. Indicates whether to return the ``jax.jit`` of
+      forward and backward. Note that jit-ing only the backward but not the
+      forward will result in the backward recompiling on every invocation, so we
+      default to jit-ing both.
+
+  Returns:
+    The two functions, ``fwd`` and ``bwd``.
+
+    If ``has_aux`` is ``False``, ``fwd(*primals)`` returns a tuple
+    ``(primals_out, residuals)``, where ``primals_out`` is ``fun(*primals)``.
+    If ``has_aux`` is ``True``, returns a ``(primals_out, residuals, aux)`` tuple
+    where ``aux`` is the auxiliary data returned by ``fun``.
+
+    ``bwd`` is a function from ``residuals`` and a cotangent vector with the same
+    shape as ``primals_out`` to a tuple of cotangent vectors with the same number
+    and shapes as the ``primals`` designated by ``argnums``, representing the
+    vector-Jacobian product of ``fun`` evaluated at ``primals``.
+  """
+  check_callable(fun)
+  argnums = _ensure_index(argnums)
+
+  def fwd(*args, **kwargs):
+    dbg = debug_info('fwd_and_bwd', fun, args, kwargs)
+    f = lu.wrap_init(fun, params=kwargs, debug_info=dbg)
+    f_partial, dyn_args = argnums_partial(
+        f, argnums, args, require_static_args_hashable=False)
+    return _vjp(f_partial, *dyn_args, has_aux=has_aux)  # type: ignore
+  def bwd(f_vjp, outgrad):
+    g = f_vjp(outgrad)
+    g = g[0] if isinstance(argnums, int) else g
+    return g
+  if jitted:
+    fwd = jit(fwd)
+    bwd = jit(bwd)
+  return fwd, bwd
 
 
 def jacfwd(fun: Callable, argnums: int | Sequence[int] = 0,
@@ -1407,10 +1481,8 @@ def pmap(
         " removed from JAX. Please migrate to pjit and remove global_arg_shapes"
         " from pmap.")
 
-  # TODO(yashkatariya): Move this out after shard_map is out of experimental and
-  # in _src
   if config.pmap_shmap_merge.value:
-    from jax.experimental.shard_map import pmap
+    from jax._src.shard_map import pmap
     return pmap(fun, axis_name, in_axes=in_axes, out_axes=out_axes,
                 static_broadcasted_argnums=static_broadcasted_argnums,
                 devices=devices, backend=backend,
@@ -1792,13 +1864,17 @@ def jvp(
 
 def _jvp(fun: lu.WrappedFun, primals, tangents, has_aux=False):
   """Variant of jvp() that takes an lu.WrappedFun."""
-  ps_flat, tree_def = tree_flatten(primals)
-  ts_flat, tree_def_2 = tree_flatten(tangents)
+  primals_, (), primal_box_data = pjit._flatten_boxes(fun.debug_info, primals, {})
+  tangents_, (), tangent_box_data = pjit._flatten_boxes(fun.debug_info, tangents, {})
+  fun = pjit._handle_boxes(fun, fun.debug_info)
+  ps_flat, tree_def = tree_flatten(primals_)
+  ts_flat, tree_def_2 = tree_flatten(tangents_)
   if tree_def != tree_def_2:
     raise TypeError("primal and tangent arguments to jax.jvp must have the same tree "
                     f"structure; primals have tree structure {tree_def} whereas tangents have "
                     f"tree structure {tree_def_2}.")
   for p, t in zip(ps_flat, ts_flat):
+    if not isinstance(core.typeof(p), ShapedArray): continue
     if core.primal_dtype_to_tangent_dtype(_dtype(p)) != _dtype(t):
       raise TypeError("primal and tangent arguments to jax.jvp do not match; "
                       "dtypes must be equal, or in case of int/bool primal dtype "
@@ -1814,9 +1890,27 @@ def _jvp(fun: lu.WrappedFun, primals, tangents, has_aux=False):
     flat_fun, out_tree = flatten_fun_nokwargs(fun, tree_def)
     out_primals, out_tangents = ad.jvp(flat_fun).call_wrapped(ps_flat, ts_flat)
     out_tree = out_tree()
+    if primal_box_data or tangent_box_data:
+      assert primal_box_data and tangent_box_data
+      box_treedef, out_tree = out_tree.children()
+      box_out_flat, out_primals = split_list(out_primals, [box_treedef.num_leaves])
+      box_dot_out_flat, out_tangents = split_list(out_tangents, [box_treedef.num_leaves])
+      box_out = tree_unflatten(box_treedef, box_out_flat)
+      box_dot_out = tree_unflatten(box_treedef, box_dot_out_flat)
+      for (i, kind), b in zip(primal_box_data, box_out):
+        if kind is pe.BoxAttr:
+          primals[i].set(tree_unflatten(b.treedef, b.leaves))
+        else:
+          assert False
+      for (i, kind), b in zip(tangent_box_data, box_dot_out):
+        if kind is pe.BoxAttr:
+          tangents[i].set(tree_unflatten(b.treedef, b.leaves))
+        else:
+          assert False
     return (tree_unflatten(out_tree, out_primals),
             tree_unflatten(out_tree, out_tangents))
   else:
+    if primal_box_data or tangent_box_data: raise NotImplementedError
     flat_fun, out_aux_trees = flatten_fun_nokwargs2(fun, tree_def)
     jvp_fun, aux = ad.jvp(flat_fun, has_aux=True)
     out_primals, out_tangents = jvp_fun.call_wrapped(ps_flat, ts_flat)
@@ -1933,10 +2027,27 @@ def _lift_linearized(jaxpr, primal_avals, io_tree, out_pvals, consts, *py_args):
     for primal_aval, tangent_aval in zip(primal_avals, tangent_avals):
       expected_tangent_aval  = primal_aval.to_tangent_aval()
       if not core.typecompat(expected_tangent_aval, tangent_aval):
-        raise ValueError("linearized function called on tangent values inconsistent with "
-                         "the original primal values: "
-                         f"got tangent aval {tangent_aval} for primal aval {primal_aval} "
-                         f"but expected {expected_tangent_aval}")
+        extra_msg = ''
+        if (isinstance(primal_aval, core.ShapedArray) and
+            isinstance(tangent_aval, core.ShapedArray) and
+            primal_aval.vma != tangent_aval.vma):
+          pvary_applications = []
+          if left := tangent_aval.vma - primal_aval.vma:
+            pvary_applications.append(
+                f"applying `jax.lax.pvary(..., {tuple(left)})` to the primal"
+                " value passed to `jax.linearize`")
+          if left := primal_aval.vma - tangent_aval.vma:
+            pvary_applications.append(
+                f"applying `jax.lax.pvary(..., {tuple(left)})` to the tangent"
+                " value passed to the callable `f_jvp` returned by"
+                " `jax.linearize`")
+          extra_msg = " \nThis might be fixed by:\n" + "\n".join(
+              f"  * {d};" for d in pvary_applications)
+        raise ValueError(
+            "linearized function called on tangent values inconsistent with "
+            "the original primal values:\n"
+            f"Got tangent aval {tangent_aval} for primal aval {primal_aval} "
+            f"but expected {expected_tangent_aval}.{extra_msg}")
     tangents_out = eval_jaxpr(jaxpr, consts, *tangents)
     tangents_out_ = iter(tangents_out)
     full_out = [pval.get_known() if pval.is_known() else next(tangents_out_)
@@ -2090,7 +2201,8 @@ def saved_input_vjp(f: Callable, which: Sequence[bool], *primals,
   fun = lu.wrap_init(f, debug_info=dbg)
   primals_flat, in_tree = tree_flatten(primals)
   fun, out_tree = flatten_fun_nokwargs(fun, in_tree)
-  out_primals_flat, _, jaxpr, residuals = ad.linearize(fun, *primals_flat)
+  out_primals_flat, out_pvals, jaxpr, residuals = ad.linearize(fun, *primals_flat)
+  out_known = [pval.is_known() for pval in out_pvals]
   primals_filt, filt_tree = tree_flatten(tuple(p for w, p in zip(which, primals) if w))
   id_map = {id(x): i for i, x in enumerate(primals_filt)}
   opaque_residuals = []
@@ -2098,7 +2210,7 @@ def saved_input_vjp(f: Callable, which: Sequence[bool], *primals,
               RSpec(opaque_residuals.append(r) or (len(opaque_residuals) - 1), False)  # type: ignore
               for r in residuals]
   f_vjp = Partial(partial(_saved_input_vjpfun, res_spec, filt_tree, in_tree,
-                          out_tree(), jaxpr), opaque_residuals)
+                          out_tree(), out_known, jaxpr), opaque_residuals)
 
   if not allow_unused and not set(id_map).issubset(res_ids := {id(r) for r in residuals}):
     unused = [(i, core.get_aval(x)) for i, (x, w) in enumerate(zip(primals, which))
@@ -2123,8 +2235,8 @@ def saved_input_vjp(f: Callable, which: Sequence[bool], *primals,
   out_primals = tree_unflatten(out_tree(), out_primals_flat)
   return out_primals, f_vjp
 
-def _saved_input_vjpfun(res_spec, filtered_tree, in_tree, out_tree, jaxpr,
-                        opaque_residuals, ct, *saved_primals):
+def _saved_input_vjpfun(res_spec, filtered_tree, in_tree, out_tree, out_known,
+                        jaxpr, opaque_residuals, ct, *saved_primals):
   primals_filtered, filtered_tree_ = tree_flatten(saved_primals)
   if filtered_tree != filtered_tree_:
     raise ValueError(
@@ -2144,8 +2256,9 @@ def _saved_input_vjpfun(res_spec, filtered_tree, in_tree, out_tree, jaxpr,
   dummy_args = [ad.UndefinedPrimal(v.aval) for v in jaxpr.invars]
   cts_flat, out_tree_ = tree_flatten(ct)
   assert out_tree_ == out_tree
+  cts_flat = [ct for ct, k in zip(cts_flat, out_known) if not k]
   arg_cts = ad.backward_pass(jaxpr, True, residuals, dummy_args, cts_flat)
-  return tree_unflatten(in_tree, arg_cts)
+  return tree_unflatten(in_tree, map(ad.instantiate_zeros, arg_cts))
 
 @dataclasses.dataclass(frozen=True)
 class RSpec:
@@ -2320,7 +2433,7 @@ def make_jaxpr(
       c:f32[] = sin a
       _:f32[] = sin b
       d:f32[] = cos b
-      e:f32[] = mul 1.0 d
+      e:f32[] = mul 1.0:f32[] d
       f:f32[] = neg e
       g:f32[] = mul f c
     in (g,) }
@@ -2713,9 +2826,10 @@ class ShapeDtypeStruct:
     if dtype is None:
       raise ValueError("ShapeDtypeStruct: dtype must be specified.")
     self.dtype = dtype if dtypes.issubdtype(dtype, dtypes.extended) else np.dtype(dtype)
-    if sharding is not None and not isinstance(sharding, (Sharding, Layout)):
+    if sharding is not None and not isinstance(sharding, (Sharding, Layout, P)):
       raise ValueError(
-          "sharding should be an instance of `jax.sharding.Sharding` or"
+          "sharding should be an instance of `jax.sharding.Sharding`, "
+          "`jax.sharding.PartitionSpec` or"
           f" `jax.experimental.layout.Layout`. Got {sharding} of type"
           f" {type(sharding)}.")
     if (isinstance(sharding, Layout) and
@@ -2723,7 +2837,19 @@ class ShapeDtypeStruct:
       raise TypeError(
           "`DeviceLocalLayout.AUTO` cannot be used in place of a device-local"
           f" layout in a `ShapeDtypeStruct`. Got {sharding}")
-    self.sharding = sharding.sharding if isinstance(sharding, Layout) else sharding
+    if isinstance(sharding, Layout):
+      self.sharding = sharding.sharding
+    elif isinstance(sharding, P):
+      # TODO(yashkatariya): Should this be abstract mesh?
+      cur_mesh = get_concrete_mesh()
+      if cur_mesh is None:
+        raise TypeError(
+            "When specifying PartitionSpec to `ShapeDtypeStruct`, the context"
+            " mesh cannot be empty. Please use `jax.sharding.use_mesh` to set"
+            " the mesh context.")
+      self.sharding = NamedSharding(cur_mesh, sharding)
+    else:
+      self.sharding = sharding
     self._dll = sharding.device_local_layout if isinstance(sharding, Layout) else None
     self.weak_type = weak_type
 
@@ -2757,9 +2883,38 @@ class ShapeDtypeStruct:
               (other.shape, other.dtype, other.sharding, other.layout, other.weak_type))
 
   def __hash__(self):
-    # TODO(frostig): avoid the conversion from dict by addressing
-    # https://github.com/jax-ml/jax/issues/8182
-    return hash((self.shape, self.dtype, self.sharding, self.layout, self.weak_type))
+    return hash((self.shape, self.dtype, self.sharding, self.layout,
+                 self.weak_type))
+
+  def __setattr__(self, name, value):
+    if hasattr(self, name):
+      if getattr(self, name) == value:
+        # This can happen if two threads race, for example if two threads
+        # are trying to hash the same SDS instance.
+        return
+      raise RuntimeError(
+          f"Cannot reassign attributes ({name}) of immutable ShapeDtypeStruct"
+          " objects")
+    super().__setattr__(name, value)
+
+  def update(self, **kwargs):
+    if 'sharding' in kwargs:
+      s = kwargs['sharding']
+      if self._dll is not None and isinstance(s, Sharding):
+        raise ValueError(
+            f"You are updating ShapeDtypeStruct with a {type(s)} when the"
+            f" original ShapeDtypeStruct had a concrete layout {self.layout}."
+            " This might lead to bugs. If you want to do this, create a new"
+            " ShapeDtypeStruct via the constructor.")
+      sharding = s
+    else:
+      sharding = self.layout
+    return ShapeDtypeStruct(
+        shape=kwargs.pop('shape', self.shape),
+        dtype=kwargs.pop('dtype', self.dtype),
+        sharding=sharding,
+        weak_type=kwargs.pop('weak_type', self.weak_type))
+
 
 def _sds_aval_mapping(x):
   aval = ShapedArray(
