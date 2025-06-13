@@ -25,31 +25,31 @@ class PlanoTreino:
 # Definição dos planos de treino disponíveis
 PLANOS_DISPONIVEIS = {
     "Treino Completo": [
-        "Agachamento",
-        "Flexao",
-        "Prancha",
-        "Lunge",
-        "Jumping Jacks",
-        "Shoulder Press"
+        ("Agachamento", 45),
+        ("Flexao", 45),
+        ("Prancha", 60),
+        ("Lunge", 45),
+        ("Jumping Jacks", 60),
+        ("Abdominais", 45)
     ],
     "Treino Superior": [
-        "Flexao",
-        "Prancha",
-        "Shoulder Press"
+        ("Flexao", 60),
+        ("Prancha", 60),
+        ("Abdominais", 45)
     ],
     "Treino Inferior": [
-        "Agachamento",
-        "Lunge",
-        "Jumping Jacks"
+        ("Agachamento", 45),
+        ("Lunge", 45),
+        ("Jumping Jacks", 60)
     ],
     "Treino Cardio": [
-        "Jumping Jacks",
-        "Agachamento",
-        "Lunge"
+        ("Jumping Jacks", 60),
+        ("Agachamento", 45),
+        ("Lunge", 45)
     ],
     "Treino Força": [
-        "Flexao",
-        "Agachamento",
-        "Shoulder Press"
+        ("Flexao", 45),
+        ("Agachamento", 45),
+        ("Abdominais", 45)
     ]
 } 

@@ -11,7 +11,9 @@ from tkinter import messagebox
 TURQUOISE = (61, 218, 215)  # Azul turquesa da página inicial
 
 def load_exercise_frames(exercise, width, height):
-    folder = os.path.join('Exercicios', exercise)
+    # Remove spaces from the exercise name to match folder names
+    folder_name = exercise.replace(" ", "")
+    folder = os.path.join('Exercicios', folder_name)
     frame_paths = sorted(glob.glob(os.path.join(folder, '*.png')))
     print(f"[DEBUG] Caminho da pasta: {folder}")
     print(f"[DEBUG] Imagens encontradas: {frame_paths}")
@@ -52,8 +54,19 @@ def put_text_with_bg(img, text, org, font, font_scale, text_color, bg_color, thi
     cv2.putText(img, text, (x + pad_x, y), font, font_scale, text_color, thickness, cv2.LINE_AA)
 
 def run_split_screen(exercicio, plano_treino=None):
-    set_exercicio(exercicio)
-    print(f"Iniciando tela dividida para: {exercicio}")
+    # Determine if it's a single exercise (string) or from a plan (tuple)
+    if isinstance(exercicio, tuple):
+        current_exercicio_name_raw = exercicio[0]
+        current_exercicio_duration = exercicio[1]
+    else:
+        current_exercicio_name_raw = exercicio
+        current_exercicio_duration = 30  # Default duration for single exercises (e.g., 30 seconds)
+
+    # Remove accents from the exercise name for display and internal use
+    current_exercicio_name = current_exercicio_name_raw.replace("ç", "c").replace("ã", "a").replace("á", "a").replace("é", "e").replace("í", "i").replace("ó", "o").replace("ú", "u").replace("ê", "e").replace("ô", "o").replace("â", "a").replace("õ", "o").replace("Á", "A").replace("É", "E").replace("Í", "I").replace("Ó", "O").replace("Ú", "U").replace("Ç", "C").replace("Ã", "A").replace("Õ", "O")
+
+    set_exercicio(current_exercicio_name)
+    print(f"Iniciando tela dividida para: {current_exercicio_name}")
     cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 960)
@@ -62,7 +75,7 @@ def run_split_screen(exercicio, plano_treino=None):
         print("[ERRO] Não foi possível acessar a câmera.")
         return
     height, width, _ = frame.shape
-    frames = load_exercise_frames(exercicio, width, height)
+    frames = load_exercise_frames(current_exercicio_name, width, height)
     num_frames = len(frames)
     frame_idx = 0
     frames_per_image = 7
@@ -72,7 +85,8 @@ def run_split_screen(exercicio, plano_treino=None):
     exercicio_iniciado = False
     exercicio_concluido = False
     tempo_inicio = None
-    tempo_duracao = 30
+    tempo_duracao = current_exercicio_duration # Use the determined duration
+    tempo_restante= tempo_duracao
     feedback_msg = ""
     feedback_color = (61, 218, 215)  # Azul esverdeado
     feedback_tick = True
@@ -86,22 +100,48 @@ def run_split_screen(exercicio, plano_treino=None):
             results = pose.process(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
             main_feedbacks = []
 
-            if not exercicio_iniciado and results.pose_landmarks:
+            # If exercicio_iniciado is False, set it to True to start the timer (for testing without camera)
+            if not exercicio_iniciado:
                 exercicio_iniciado = True
                 tempo_inicio = time.time()
 
             if exercicio_iniciado and not exercicio_concluido:
                 tempo_atual = time.time()
                 tempo_decorrido = tempo_atual - tempo_inicio
+                if tempo_inicio is None:
+                    tempo_inicio = tempo_atual
+                    tempo_decorrido = 0
+                else:
+                    tempo_decorrido = tempo_atual - tempo_inicio
                 if tempo_decorrido >= tempo_duracao:
                     exercicio_concluido = True
                     if plano_treino:
                         proximo_exercicio = plano_treino.proximo_exercicio()
                         if proximo_exercicio is not None:
-                            cv2.putText(frame, "Exercício Concluído!", (width//2 - 150, height//2),
-                                      cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-                            cv2.putText(frame, f"Próximo: {proximo_exercicio}", (width//2 - 150, height//2 + 40),
-                                      cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+                            # Style for "Exercício Concluído!" and "Próximo:"
+                            box_margin_x = 100
+                            box_width = width - 2 * box_margin_x
+                            box_height = 150
+                            box_y = height // 2 - box_height // 2
+
+                            # Draw a larger rounded box for the notification
+                            draw_rounded_box(frame,
+                                             (box_margin_x, box_y),
+                                             (box_margin_x + box_width, box_y + box_height),
+                                             TURQUOISE, radius=40, alpha=0.95)
+
+                            # Display "Exercício Concluído!"
+                            put_text_with_bg(frame, "Exercicio Concluido!",
+                                             (width // 2 - cv2.getTextSize("Exercicio Concluido!", cv2.FONT_HERSHEY_SIMPLEX, 1, 2)[0][0] // 2, box_y + 50),
+                                             cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), TURQUOISE, thickness=2, pad_x=0, pad_y=0, radius=0, alpha=0)
+
+                            # Display "Próximo: [Exercise Name], [Duration] seg"
+                            next_exercise_text_raw = f"Proximo: {proximo_exercicio[0]}, {proximo_exercicio[1]} seg"
+                            next_exercise_text = next_exercise_text_raw.replace("ç", "c").replace("ã", "a").replace("á", "a").replace("é", "e").replace("í", "i").replace("ó", "o").replace("ú", "u").replace("ê", "e").replace("ô", "o").replace("â", "a").replace("õ", "o").replace("Á", "A").replace("É", "E").replace("Í", "I").replace("Ó", "O").replace("Ú", "U").replace("Ç", "C").replace("Ã", "A").replace("Õ", "O")
+                            put_text_with_bg(frame, next_exercise_text,
+                                             (width // 2 - cv2.getTextSize(next_exercise_text, cv2.FONT_HERSHEY_SIMPLEX, 1, 2)[0][0] // 2, box_y + 100),
+                                             cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), TURQUOISE, thickness=2, pad_x=0, pad_y=0, radius=0, alpha=0)
+
                             cv2.imshow("Exercício", frame)
                             cv2.waitKey(2000)
                             exercicio = proximo_exercicio
@@ -112,12 +152,29 @@ def run_split_screen(exercicio, plano_treino=None):
                             exercicio_iniciado = False
                             exercicio_concluido = False
                             tempo_inicio = None
+                            tempo_duracao = exercicio[1] # Set new duration from the next exercise
+                            tempo_restante = tempo_duracao # Reset remaining time
                             continue
                         else:
-                            cv2.putText(frame, "Plano de Treino Concluído!", (width//2 - 200, height//2),
-                                      cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-                            cv2.putText(frame, "Retornando ao menu principal...", (width//2 - 200, height//2 + 40),
-                                      cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+                            # Style for "Plano de Treino Concluído!" and "Retornando ao menu principal..."
+                            box_margin_x = 100
+                            box_width = width - 2 * box_margin_x
+                            box_height = 150
+                            box_y = height // 2 - box_height // 2
+
+                            # Draw a larger rounded box for the notification
+                            draw_rounded_box(frame,
+                                             (box_margin_x, box_y),
+                                             (box_margin_x + box_width, box_y + box_height),
+                                             TURQUOISE, radius=40, alpha=0.95)
+
+                            put_text_with_bg(frame, "Plano de Treino Concluido!",
+                                             (width // 2 - cv2.getTextSize("Plano de Treino Concluido!", cv2.FONT_HERSHEY_SIMPLEX, 1, 2)[0][0] // 2, box_y + 50),
+                                             cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), TURQUOISE, thickness=2, pad_x=0, pad_y=0, radius=0, alpha=0)
+                            put_text_with_bg(frame, "Retornando ao menu principal...",
+                                             (width // 2 - cv2.getTextSize("Retornando ao menu principal...", cv2.FONT_HERSHEY_SIMPLEX, 1, 2)[0][0] // 2, box_y + 100),
+                                             cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), TURQUOISE, thickness=2, pad_x=0, pad_y=0, radius=0, alpha=0)
+
                             cv2.imshow("Exercício", frame)
                             cv2.waitKey(2000)
                             cap.release()
@@ -162,8 +219,8 @@ def run_split_screen(exercicio, plano_treino=None):
             box_w = 420
             box_h = 90
             draw_rounded_box(frame, (0, 0), (box_w, box_h), TURQUOISE, radius=40, alpha=0.95)
-            cv2.putText(frame, "Exercicio Atual:", (30, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (255,255,255), 2, cv2.LINE_AA)
-            cv2.putText(frame, exercicio, (30, 80), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (255,255,255), 3, cv2.LINE_AA)
+            put_text_with_bg(frame, "Exercicio Atual:", (30, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (255,255,255), TURQUOISE, thickness=2, pad_x=0, pad_y=0, radius=0, alpha=0)
+            put_text_with_bg(frame, current_exercicio_name, (30, 80), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255,255,255), TURQUOISE, thickness=3, pad_x=0, pad_y=0, radius=0, alpha=0)
 
             # Caixa topo direito: Feedback
             if feedback_msg:
@@ -172,10 +229,9 @@ def run_split_screen(exercicio, plano_treino=None):
                 font = cv2.FONT_HERSHEY_SIMPLEX
                 font_scale = 1
                 thickness = 2
-                # Remover acentos do feedback
-                feedback_msg_sem_acentos = feedback_msg.replace("ç", "c").replace("ã", "a").replace("á", "a").replace("é", "e").replace("í", "i").replace("ó", "o").replace("ú", "u").replace("ê", "e").replace("ô", "o").replace("â", "a").replace("õ", "o").replace("ê", "e").replace("ú", "u").replace("í", "i").replace("Á", "A").replace("É", "E").replace("Í", "I").replace("Ó", "O").replace("Ú", "U").replace("Ç", "C").replace("Ã", "A").replace("Õ", "O")
+                feedback_msg_to_display = feedback_msg.replace("ç", "c").replace("ã", "a").replace("á", "a").replace("é", "e").replace("í", "i").replace("ó", "o").replace("ú", "u").replace("ê", "e").replace("ô", "o").replace("â", "a").replace("õ", "o").replace("Á", "A").replace("É", "E").replace("Í", "I").replace("Ó", "O").replace("Ú", "U").replace("Ç", "C").replace("Ã", "A").replace("Õ", "O")
                 # Quebrar o texto em múltiplas linhas se necessário
-                words = feedback_msg_sem_acentos.split()
+                words = feedback_msg_to_display.split()
                 lines = []
                 current_line = ""
                 for word in words:
@@ -199,10 +255,10 @@ def run_split_screen(exercicio, plano_treino=None):
                 if feedback_tick:
                     # Desenhar círculo verde com check
                     cv2.circle(frame, (x1+40, y1+30), 20, (57, 255, 128), -1)
-                    cv2.putText(frame, "✓", (x1+28, y1+42), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (255,255,255), 3, cv2.LINE_AA)
+                    put_text_with_bg(frame, "✓", (x1+28, y1+42), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (255,255,255), TURQUOISE, thickness=3, pad_x=0, pad_y=0, radius=0, alpha=0)
                 # Escrever cada linha do feedback
                 for i, line in enumerate(lines):
-                    cv2.putText(frame, line, (x1+80, y1+40 + i*40), font, font_scale, (255,255,255), thickness, cv2.LINE_AA)
+                    put_text_with_bg(frame, line, (x1+80, y1+40 + i*40), font, font_scale, (255,255,255), TURQUOISE, thickness=thickness, pad_x=0, pad_y=0, radius=0, alpha=0)
 
             # Caixa canto inferior esquerdo: Modelo de referência
             mini_w = width // 5
@@ -228,18 +284,18 @@ def run_split_screen(exercicio, plano_treino=None):
             texto_y = model_y + mini_h + 35
             if texto_y > height - 10:
                 texto_y = height - 10
-            cv2.putText(frame, "Modelo de Referencia", (model_x+10, texto_y), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255,255,255), 2, cv2.LINE_AA)
+            put_text_with_bg(frame, "Modelo de Referencia", (model_x+10, texto_y), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255,255,255), TURQUOISE, thickness=2, pad_x=0, pad_y=0, radius=0, alpha=0)
 
             # Caixa canto inferior direito: Tempo restante (apenas se estiver em plano de treino)
             if plano_treino is not None:
                 tbox_w = 350
                 tbox_h = 60
                 draw_rounded_box(frame, (width-tbox_w-30, height-tbox_h-30), (width-30, height-30), TURQUOISE, radius=30, alpha=0.95)
-                tempo_restante = 0
+                
                 if exercicio_iniciado and not exercicio_concluido:
-                    tempo_restante = max(0, tempo_duracao - (time.time() - tempo_inicio))
-                cv2.putText(frame, "Tempo restante:", (width-tbox_w, height-45), cv2.FONT_HERSHEY_SIMPLEX, 1, (255,255,255), 2, cv2.LINE_AA)
-                cv2.putText(frame, f"{int(tempo_restante)}s", (width-110, height-45), cv2.FONT_HERSHEY_SIMPLEX, 1.3, (255, 214, 0), 3, cv2.LINE_AA)
+                    tempo_restante = max(0, tempo_duracao - int(time.time() - tempo_inicio))
+                
+                put_text_with_bg(frame, f"Tempo restante: {tempo_restante} seg", (width-tbox_w, height-45), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255,255,255), TURQUOISE, thickness=2, pad_x=0, pad_y=0, radius=0, alpha=0)
 
             cv2.imshow("Exercício", frame)
 

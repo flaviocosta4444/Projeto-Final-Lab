@@ -82,7 +82,7 @@ def init_application():
         exercises = [
             "Agachamento", "Flexao", "Prancha",
             "Prancha", "Jumping Jacks", "Lunge",
-            "Shoulder Press"
+            "Abdominais"
         ]
         grid_frame = tk.Frame(left_frame, bg=COLORS["background"])
         grid_frame.pack(pady=(0, 0))
