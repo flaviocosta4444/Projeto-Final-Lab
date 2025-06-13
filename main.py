@@ -4,7 +4,7 @@ from PIL import Image, ImageTk
 import os
 import sys
 import traceback
-from pose_analysis import process_image, process_camera, set_exercicio, exercicio_atual, get_reference_pose, create_stick_figure, pontuacao, etapa_atual
+from pose_analysis import process_image, process_camera, set_exercicio, exercicio_atual, get_reference_pose, create_stick_figure, pontuacao, etapa_atual, analyze_video
 import cv2
 import numpy as np
 from split_screen_app import run_split_screen
@@ -98,6 +98,19 @@ def init_application():
                 bold=True
             )
             btn.grid(row=row, column=col, padx=18, pady=12, sticky="ew")
+
+        # Botão para análise de vídeo
+        video_btn = create_button(
+            grid_frame,
+            "Analisar Vídeo",
+            lambda: analyze_video_exercise(),
+            color=COLORS["accent"],
+            fg=COLORS["primary"],
+            font_size=16,
+            bold=True
+        )
+        video_btn.grid(row=len(exercises)//2 + 1, column=0, columnspan=2, padx=18, pady=12, sticky="ew")
+
         # Ajustar largura dos botões
         for col in range(2):
             grid_frame.grid_columnconfigure(col, weight=1)
@@ -189,6 +202,69 @@ def init_application():
             except Exception as e:
                 messagebox.showerror("Erro", f"Erro ao iniciar plano: {str(e)}")
                 root.deiconify()
+
+        def analyze_video_exercise():
+            try:
+                # Primeiro, selecionar o exercício
+                exercise_dialog = tk.Toplevel(root)
+                exercise_dialog.title("Selecionar Exercício")
+                exercise_dialog.geometry("300x400")
+                exercise_dialog.configure(bg=COLORS["background"])
+                
+                exercise_listbox = tk.Listbox(exercise_dialog, 
+                                            font=("Helvetica", 14),
+                                            bg=COLORS["white"],
+                                            fg=COLORS["primary"],
+                                            selectbackground=COLORS["primary"],
+                                            selectforeground=COLORS["white"],
+                                            height=10,
+                                            bd=0,
+                                            highlightthickness=0)
+                exercise_listbox.pack(fill="x", padx=20, pady=20)
+                
+                for exercise in exercises:
+                    exercise_listbox.insert(tk.END, exercise)
+                
+                def on_exercise_select():
+                    selection = exercise_listbox.curselection()
+                    if selection:
+                        exercise_name = exercise_listbox.get(selection[0])
+                        exercise_dialog.destroy()
+                        
+                        # Agora selecionar o vídeo
+                        video_path = filedialog.askopenfilename(
+                            title="Selecionar Vídeo",
+                            filetypes=[
+                                ("Arquivos de Vídeo", "*.mp4 *.avi *.mov"),
+                                ("Todos os Arquivos", "*.*")
+                            ]
+                        )
+                        
+                        if video_path:
+                            try:
+                                tk.Tk.root = root
+                                root.withdraw()
+                                analyze_video(video_path, exercise_name)
+                                root.deiconify()
+                            except Exception as e:
+                                messagebox.showerror("Erro", f"Erro ao analisar vídeo: {str(e)}")
+                                root.deiconify()
+                    else:
+                        messagebox.showwarning("Aviso", "Por favor, selecione um exercício.")
+                
+                select_btn = create_button(
+                    exercise_dialog,
+                    "Selecionar",
+                    on_exercise_select,
+                    color=COLORS["accent"],
+                    fg=COLORS["primary"],
+                    font_size=14,
+                    bold=True
+                )
+                select_btn.pack(pady=20)
+                
+            except Exception as e:
+                messagebox.showerror("Erro", f"Erro ao iniciar análise de vídeo: {str(e)}")
 
         return root
 

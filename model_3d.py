@@ -311,12 +311,23 @@ class Model3D:
                     "Ombro Direito": 30,
                     "Ombro Esquerdo": 150
                 }
-            else:  # Posição agachada
+            elif stage == 1:  # Meio caminho
                 self.angles = {
-                    "Tronco": 110,
-                    "Quadril": 80,
-                    "Joelho Direito": 80,
-                    "Joelho Esquerdo": 80,
+                    "Tronco": 90,
+                    "Quadril": 120,
+                    "Joelho Direito": 120,
+                    "Joelho Esquerdo": 120,
+                    "Cotovelo Direito": 160,
+                    "Cotovelo Esquerdo": 160,
+                    "Ombro Direito": 30,
+                    "Ombro Esquerdo": 150
+                }
+            else:  # Posição agachada completa
+                self.angles = {
+                    "Tronco": 90,
+                    "Quadril": 90,
+                    "Joelho Direito": 90,
+                    "Joelho Esquerdo": 90,
                     "Cotovelo Direito": 160,
                     "Cotovelo Esquerdo": 160,
                     "Ombro Direito": 30,
@@ -351,8 +362,8 @@ class Model3D:
             self.angles = {
                 "Tronco": 0,  # Paralelo ao chão
                 "Quadril": 170,
-                "Joelho Direito": 170,
-                "Joelho Esquerdo": 170,
+                "Joelho Direito": 175,
+                "Joelho Esquerdo": 175,
                 "Cotovelo Direito": 90,
                 "Cotovelo Esquerdo": 90,
                 "Ombro Direito": 180,
@@ -418,52 +429,28 @@ class Model3D:
                     "Ombro Esquerdo": 0
                 }
         
-        elif exercise == "Deadlift":
-            if stage == 0:  # Posição inicial
+        elif exercise == "Abdominais":
+            if stage == 0:  # Posição inicial (deitado)
                 self.angles = {
-                    "Tronco": 90,
-                    "Quadril": 175,
-                    "Joelho Direito": 175,
-                    "Joelho Esquerdo": 175,
-                    "Cotovelo Direito": 175,
-                    "Cotovelo Esquerdo": 175,
-                    "Ombro Direito": 30,
-                    "Ombro Esquerdo": 150
-                }
-            else:  # Posição baixa
-                self.angles = {
-                    "Tronco": 45,  # Inclinado para frente
-                    "Quadril": 90,
-                    "Joelho Direito": 140,
-                    "Joelho Esquerdo": 140,
-                    "Cotovelo Direito": 175,
-                    "Cotovelo Esquerdo": 175,
-                    "Ombro Direito": 30,
-                    "Ombro Esquerdo": 150
-                }
-        
-        elif exercise == "Shoulder Press":
-            if stage == 0:  # Posição inicial
-                self.angles = {
-                    "Tronco": 90,
-                    "Quadril": 175,
-                    "Joelho Direito": 175,
-                    "Joelho Esquerdo": 175,
+                    "Tronco": 0,  # Deitado
+                    "Quadril": 0,  # Deitado
+                    "Joelho Direito": 90,
+                    "Joelho Esquerdo": 90,
                     "Cotovelo Direito": 90,
                     "Cotovelo Esquerdo": 90,
-                    "Ombro Direito": 60,
-                    "Ombro Esquerdo": 120
+                    "Ombro Direito": 90,
+                    "Ombro Esquerdo": 90
                 }
-            else:  # Posição alta
+            else:  # Posição elevada
                 self.angles = {
-                    "Tronco": 90,
-                    "Quadril": 175,
-                    "Joelho Direito": 175,
-                    "Joelho Esquerdo": 175,
-                    "Cotovelo Direito": 175,
-                    "Cotovelo Esquerdo": 175,
-                    "Ombro Direito": 170,
-                    "Ombro Esquerdo": 10
+                    "Tronco": 45,  # Semi-elevado
+                    "Quadril": 45,  # Semi-elevado
+                    "Joelho Direito": 90,
+                    "Joelho Esquerdo": 90,
+                    "Cotovelo Direito": 90,
+                    "Cotovelo Esquerdo": 90,
+                    "Ombro Direito": 90,
+                    "Ombro Esquerdo": 90
                 }
     
     def render_to_image(self, width, height, exercise="Agachamento", stage=0, countdown=0):
